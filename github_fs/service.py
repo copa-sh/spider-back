@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import math
 import random
 import threading
@@ -24,6 +25,9 @@ from .utils import (
     utc_now_compact,
     utc_now_iso,
 )
+
+
+LOGGER = logging.getLogger("github-fs")
 
 
 class ServiceError(Exception):
@@ -114,12 +118,14 @@ class AppService:
         process_lock = self._task_locks[task_name]
         if not process_lock.acquire(blocking=False):
             state = self.get_state()
+            LOGGER.info("%s omitido: ya hay otra ejecucion en curso.", task_name)
             return TaskResult(False, state["tasks"][task_name].get("last_summary", {}), "Task already running")
 
         try:
             with self._acquire_task_file_lock(task_name) as acquired:
                 if not acquired:
                     state = self.get_state()
+                    LOGGER.info("%s omitido: lock global ocupado por otro proceso.", task_name)
                     return TaskResult(False, state["tasks"][task_name].get("last_summary", {}), "Task already running")
 
                 state = self.state_manager.load(self.default_config)
@@ -128,6 +134,7 @@ class AppService:
                 task["last_started_at"] = utc_now_iso()
                 task["last_error"] = None
                 self.state_manager.save(state)
+                LOGGER.info("%s iniciado.", task_name)
 
                 result = callback(state)
                 state["tasks"][task_name]["running"] = False
@@ -136,6 +143,7 @@ class AppService:
                 state["tasks"][task_name]["last_error"] = result.error
                 state["tasks"][task_name]["last_summary"] = result.summary
                 self.state_manager.save(state)
+                LOGGER.info("%s finalizado con resultado=%s resumen=%s", task_name, "success" if result.ok else "error", result.summary)
                 return result
         except Exception as exc:
             state = self.state_manager.load(self.default_config)
@@ -145,6 +153,7 @@ class AppService:
             state["tasks"][task_name]["last_error"] = str(exc)
             state["tasks"][task_name]["last_summary"] = {}
             self.state_manager.save(state)
+            LOGGER.exception("%s fallo con excepcion no controlada.", task_name)
             return TaskResult(False, {}, str(exc))
         finally:
             process_lock.release()
@@ -195,6 +204,13 @@ class AppService:
 
             changed_files.append((file_id, file_path, rel_path, size, mtime_ns, source_sha256))
 
+        LOGGER.info(
+            "sync analizado: %s archivos detectados, %s pendientes de subida, %s ya estaban al dia.",
+            len(discovered_paths),
+            len(changed_files),
+            len(discovered_paths) - len(changed_files),
+        )
+
         for entry in files_state.values():
             if entry["path"] not in discovered_paths:
                 entry["present"] = False
@@ -217,6 +233,7 @@ class AppService:
                 },
             )
             try:
+                LOGGER.info("sync subiendo archivo path=%s size=%sB", rel_path, size)
                 version = self._upload_file_version(state, file_id, file_path, rel_path, size, mtime_ns, source_sha256)
                 entry["path"] = rel_path
                 entry["present"] = True
@@ -229,6 +246,14 @@ class AppService:
                 entry["last_error"] = None
                 uploaded_files += 1
                 uploaded_bytes += version["uploaded_bytes"]
+                LOGGER.info(
+                    "sync archivo subido path=%s cuenta=%s repo=%s version=%s bytes=%s",
+                    rel_path,
+                    version["account_id"],
+                    version["repository"],
+                    version["version_id"],
+                    version["uploaded_bytes"],
+                )
             except Exception as exc:
                 entry["path"] = rel_path
                 entry["present"] = True
@@ -238,6 +263,7 @@ class AppService:
                 entry["last_seen_at"] = utc_now_iso()
                 entry["last_error"] = str(exc)
                 failed_files += 1
+                LOGGER.exception("sync error subiendo path=%s", rel_path)
 
         self.state_manager.save(state)
         summary = {
@@ -337,6 +363,15 @@ class AppService:
         estimated_upload_bytes = len(encrypted["ciphertext"]) + self._estimate_manifest_bytes(rel_path, len(chunk_items))
         target = self._allocate_upload_target(state, estimated_upload_bytes)
         client = self._client_for_account(target.account_id)
+        LOGGER.info(
+            "sync destino elegido path=%s cuenta=%s owner=%s repo=%s chunks=%s estimado=%sB",
+            rel_path,
+            target.account_id,
+            target.owner,
+            target.repository,
+            len(chunk_items),
+            estimated_upload_bytes,
+        )
 
         version_id = utc_now_compact()
         remote_prefix = f"{self.config.github_uploads_prefix}/{file_id}/{version_id}"
@@ -345,6 +380,14 @@ class AppService:
         uploaded_bytes = 0
 
         for chunk_index, chunk in chunk_items:
+            LOGGER.info(
+                "sync subiendo chunk path=%s chunk=%s/%s size=%sB repo=%s",
+                rel_path,
+                chunk_index + 1,
+                len(chunk_items),
+                len(chunk),
+                target.repository,
+            )
             chunk_sha = client.create_blob(target.owner, target.repository, chunk)
             self._sleep_after_upload()
             chunk_path = f"{remote_prefix}/chunk_{chunk_index:04d}.bin"
@@ -388,6 +431,7 @@ class AppService:
 
         manifest_bytes = json.dumps(version_manifest, ensure_ascii=False, indent=2).encode("utf-8")
         self._assert_target_capacity(state, target, uploaded_bytes + len(manifest_bytes))
+        LOGGER.info("sync subiendo manifest path=%s size=%sB repo=%s", rel_path, len(manifest_bytes), target.repository)
         manifest_sha = client.create_blob(target.owner, target.repository, manifest_bytes)
         self._sleep_after_upload()
         manifest_path = f"{remote_prefix}/manifest.json"
@@ -401,6 +445,7 @@ class AppService:
             tree_entries,
             f"github-fs sync {utc_now_iso()} ({rel_path})",
         )
+        LOGGER.info("sync commit creado path=%s repo=%s commit=%s", rel_path, target.repository, commit_sha)
 
         self._record_uploaded_bytes(state, target.account_id, uploaded_bytes)
         self._bump_repository_size(state, target.account_id, target.repository, uploaded_bytes)
@@ -512,6 +557,7 @@ class AppService:
                 break
             next_index += 1
         client = self._client_for_account(account.account_id)
+        LOGGER.info("sync creando repositorio nuevo cuenta=%s owner=%s repo=%s", account.account_id, account.owner, candidate)
         info = client.create_repository(account.owner, candidate, self.config.github_repository_private)
         repo_state = account_state["repositories"].setdefault(candidate, {})
         repo_state["name"] = candidate
