@@ -24,6 +24,16 @@ HOME_TEMPLATE = """
     <p><strong>Archivos ausentes:</strong> {{ stats.absent }}</p>
     <p><strong>Archivos con error:</strong> {{ stats.with_error }}</p>
     <p><strong>Total de versiones:</strong> {{ stats.total_versions }}</p>
+    <h2>Cuentas GitHub</h2>
+    <ul>
+      {% for account in state.github_account_summaries %}
+      <li>
+        {{ account.account_id }} ({{ account.owner }}) |
+        hoy={{ account.uploaded_today_bytes }}/{{ account.daily_limit_bytes }} bytes |
+        repos={{ account.repositories|length }}
+      </li>
+      {% endfor %}
+    </ul>
     <form method="post" action="{{ url_for('trigger_sync') }}">
       <button type="submit">Lanzar sync</button>
     </form>
@@ -93,7 +103,9 @@ FILE_TEMPLATE = """
         <a href="{{ version.manifest_raw_url }}">manifest</a> |
         chunks={{ version.chunks|length }} |
         commit={{ version.commit_sha or "pendiente" }} |
-        sha={{ version.plaintext_sha256 }}
+        sha={{ version.plaintext_sha256 }} |
+        cuenta={{ version.account_id }} |
+        repo={{ version.repository_owner }}/{{ version.repository }}
       </li>
       {% endfor %}
     </ul>

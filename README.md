@@ -1,92 +1,42 @@
 # github-fs
 
-Servicio persistente para vigilar un volumen montado en solo lectura, cifrar archivos antes de subirlos a GitHub en chunks, y verificar periódicamente la integridad reconstruyendo los datos desde GitHub.
+Daemon que lee `/datos` en solo lectura, cifra archivos, los reparte entre varias cuentas GitHub y verifica periódicamente la integridad reconstruyendo cada versión desde GitHub.
 
 ## Qué hace
 
-- Lee un directorio montado como solo lectura, por ejemplo `/mnt/datos/timeline:/datos:ro`.
-- Detecta archivos nuevos o modificados y sube nuevas versiones cifradas a GitHub.
-- Mantiene un índice persistente local en `/state/index.json`.
-- Expone una web mínima con PIN para ver:
-  - última sincronización
-  - última verificación de integridad
-  - resumen de archivos presentes, ausentes y con error
-  - historial de versiones por archivo
-- Si faltan `APP_WEB_PIN` o `APP_ENCRYPTION_KEY`, los genera automáticamente y los guarda en `/state/secrets.json`.
-
-## Arquitectura
-
-- `/datos`: volumen de entrada solo lectura.
-- `/state`: volumen persistente de escritura para estado, secretos y metadatos.
-- GitHub: almacena chunks cifrados y un `manifest.json` por versión.
-
-El índice operativo principal vive en `/state/index.json`. GitHub se usa como almacenamiento remoto inmutable de versiones.
-
-## Instalación con Docker Compose
-
-1. Crea tu `.env` a partir del ejemplo:
-
-```bash
-cp .env.example .env
-```
-
-2. Ajusta al menos estas variables:
-
-```env
-GITHUB_TOKEN=ghp_...
-GITHUB_REPOSITORY=owner/repo
-GITHUB_BRANCH=main
-APP_DATA_BIND=/mnt/datos/timeline
-APP_WEB_PORT=8080
-```
-
-3. Arranca el servicio:
-
-```bash
-docker compose up -d --build
-```
-
-4. Consulta el PIN generado si no lo fijaste en `.env`:
-
-```bash
-docker compose logs app
-```
-
-La web quedará en `http://localhost:8080`.
-
-## docker-compose.yml
-
-El proyecto ya incluye esta configuración:
-
-```yaml
-services:
-  app:
-    build: .
-    env_file:
-      - .env
-    ports:
-      - "${APP_WEB_PORT:-8080}:8080"
-    volumes:
-      - ${APP_DATA_BIND:-/mnt/datos/timeline}:${APP_DATA_DIR:-/datos}:ro
-      - app-state:${APP_STATE_DIR:-/state}
-    restart: unless-stopped
-```
+- Detecta archivos nuevos o modificados por hash.
+- Cifra cada archivo con AES-256-GCM y lo divide en chunks.
+- Elige aleatoriamente una cuenta GitHub con cuota diaria disponible.
+- Elige aleatoriamente un repositorio gestionado por la app con capacidad disponible o crea uno nuevo automáticamente.
+- Guarda en `/state/index.json` en qué cuenta y repo quedó cada versión.
+- Verifica integridad descargando los chunks cifrados con el token correcto de su cuenta de origen.
+- Expone una web mínima con PIN para ver tareas, archivos, cuentas y repos gestionados.
 
 ## Variables de entorno
 
-Obligatorias:
+La aplicación ya no usa `GITHUB_REPOSITORY` como configuración principal. Se definen cuentas numeradas:
 
-- `GITHUB_TOKEN`
-- `GITHUB_REPOSITORY`
+```env
+GITHUB_ACCOUNT_1_TOKEN=ghp_xxx
+GITHUB_ACCOUNT_1_OWNER=mi-usuario
+GITHUB_ACCOUNT_2_TOKEN=ghp_yyy
+GITHUB_ACCOUNT_2_OWNER=mi-org-o-usuario
+```
 
-Opcionales relevantes:
+Variables globales relevantes:
 
 - `GITHUB_BRANCH=main`
 - `GITHUB_UPLOADS_PREFIX=storage`
+- `GITHUB_REPOSITORY_PREFIX=github-fs`
+- `GITHUB_REPOSITORY_PRIVATE=true`
+- `GITHUB_REPOSITORY_MAX_SIZE_KB=524288`
+- `GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB=5`
 - `GITHUB_CHUNK_SIZE_MB=24`
 - `GITHUB_TIMEOUT_SECONDS=300`
 - `GITHUB_MAX_RETRY=3`
 - `GITHUB_BACKOFF_SECONDS=2`
+- `GITHUB_UPLOAD_SLEEP_MIN_SECONDS=0.25`
+- `GITHUB_UPLOAD_SLEEP_MAX_SECONDS=1.5`
 - `APP_DATA_DIR=/datos`
 - `APP_STATE_DIR=/state`
 - `APP_WEB_HOST=0.0.0.0`
@@ -96,56 +46,62 @@ Opcionales relevantes:
 - `APP_WEB_PIN`
 - `APP_ENCRYPTION_KEY`
 
-Por defecto, la revisión de nuevos/modificados y la verificación de integridad se ejecutan una vez por semana.
+Si `APP_WEB_PIN` o `APP_ENCRYPTION_KEY` no están definidos, se generan automáticamente y se guardan en `/state/secrets.json`.
 
-## Estado local
+## Política de almacenamiento remoto
 
-Archivos persistidos en `/state`:
+- Los repositorios se crean automáticamente con el patrón `prefijo-0001`, `prefijo-0002`, etc.
+- Antes de usar un repo, la app consulta `GET /repos/{owner}/{repo}` y usa `size` como tamaño actual en KB.
+- Cada cuenta tiene un cupo diario por fecha UTC, medido en bytes realmente subidos.
+- Cada subida remota aplica un sleep aleatorio entre `GITHUB_UPLOAD_SLEEP_MIN_SECONDS` y `GITHUB_UPLOAD_SLEEP_MAX_SECONDS`.
+- Una misma ruta puede tener versiones históricas en cuentas y repos distintos.
 
-- `index.json`: estado operativo, tareas y catálogo de archivos.
-- `secrets.json`: PIN web, clave de cifrado y `secret_key` de Flask.
+## Estado persistente
 
-Cada archivo se guarda con:
+En `/state/index.json` se guardan:
 
-- ruta relativa
-- presencia actual en el volumen
-- tamaño y `mtime_ns`
-- `source_sha256`
-- versión activa
-- historial de versiones
-- último resultado de verificación
+- tareas de sync y verify
+- catálogo de archivos y versiones
+- bloque `github_accounts` con:
+  - owner por cuenta
+  - repos gestionados
+  - último tamaño conocido por repo
+  - buckets diarios de bytes subidos
+- ubicación remota completa por versión:
+  - `account_id`
+  - `repository_owner`
+  - `repository`
+  - `branch`
+  - `manifest_path`
+  - `manifest_raw_url`
+  - `commit_sha`
+  - chunks con `raw_url` y su cuenta asociada
 
-Cada versión guarda:
+## Docker Compose
 
-- `version_id`
-- fecha de creación
-- `plaintext_sha256`
-- `ciphertext_sha256`
-- nonce AES-GCM
-- manifiesto remoto
-- lista de chunks con URL y hash
+1. Crea tu `.env`:
 
-## Política de cambios
+```bash
+cp .env.example .env
+```
 
-- Archivo nuevo: se sube.
-- Archivo modificado: se crea nueva versión activa.
-- Archivo borrado del volumen: se marca como ausente, pero se conserva el historial.
+2. Ajusta tus cuentas GitHub, límites y bind mount de datos.
 
-No se borran versiones remotas de GitHub.
+3. Arranca:
 
-## Verificación de integridad
+```bash
+docker compose up -d --build
+```
 
-La verificación:
+4. Si no definiste PIN, consulta logs:
 
-1. Calcula el SHA-256 del archivo actual en `/datos`.
-2. Descarga todos los chunks de la versión activa desde GitHub.
-3. Comprueba el hash de cada chunk cifrado.
-4. Descifra el contenido con AES-256-GCM.
-5. Compara el SHA-256 reconstruido con el del volumen.
+```bash
+docker compose logs app
+```
 
-## Interfaz web
+## Web
 
-Rutas principales:
+Rutas disponibles:
 
 - `GET /login`
 - `POST /login`
@@ -155,14 +111,14 @@ Rutas principales:
 - `POST /actions/sync`
 - `POST /actions/verify`
 
-La sesión usa cookie firmada de Flask y acceso por PIN.
+La home muestra últimas ejecuciones y resumen de cuotas/repos por cuenta.
 
-## Ejecución fuera de Docker
+## Desarrollo
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 python3 -m github_fs.main daemon
 ```
 
@@ -173,15 +129,7 @@ python3 -m github_fs.main run-once-sync
 python3 -m github_fs.main run-once-verify
 ```
 
-## Desarrollo y pruebas
-
-Instalación de dependencias de desarrollo:
-
-```bash
-pip install -r requirements-dev.txt
-```
-
-Ejecución de tests:
+Tests:
 
 ```bash
 python3 -m pytest

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ DEFAULT_MAX_RETRY = 3
 DEFAULT_BACKOFF_SECONDS = 2
 DEFAULT_CHUNK_SIZE_MB = 24
 DEFAULT_INTERVAL_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_REPOSITORY_PREFIX = "data-"
 
 
 class ConfigError(Exception):
@@ -40,9 +42,11 @@ def load_dotenv_file(path: str = ".env") -> None:
             os.environ[key] = value
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_int(name: str, default: int | None = None) -> int:
     value = os.environ.get(name)
     if value is None or not value.strip():
+        if default is None:
+            raise ConfigError(f"Falta {name}.")
         return default
     try:
         parsed = int(value)
@@ -53,24 +57,68 @@ def _env_int(name: str, default: int) -> int:
     return parsed
 
 
-def _validate_repository_format(repo: str) -> None:
+def _env_float(name: str, default: float | None = None, allow_zero: bool = False) -> float:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        if default is None:
+            raise ConfigError(f"Falta {name}.")
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ConfigError(f"{name} debe ser un numero.") from exc
+    if allow_zero:
+        if parsed < 0:
+            raise ConfigError(f"{name} no puede ser negativo.")
+    elif parsed <= 0:
+        raise ConfigError(f"{name} debe ser mayor que 0.")
+    return parsed
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ConfigError(f"{name} debe ser un booleano valido.")
+
+
+def _validate_repository_format(repo: str) -> tuple[str, str]:
     if repo.count("/") != 1:
         raise ConfigError("GITHUB_REPOSITORY debe tener el formato 'owner/repo'.")
     owner, name = repo.split("/", 1)
     if not owner or not name:
         raise ConfigError("GITHUB_REPOSITORY no puede tener owner o repo vacios.")
+    return owner, name
+
+
+@dataclass(frozen=True)
+class GitHubAccountConfig:
+    account_id: str
+    owner: str
+    token: str
+    pinned_repository: str | None = None
 
 
 @dataclass(frozen=True)
 class AppConfig:
-    github_token: str
-    github_repository: str
+    github_accounts: tuple[GitHubAccountConfig, ...]
     github_branch: str
     github_uploads_prefix: str
+    github_repository_prefix: str
+    github_repository_private: bool
+    github_repository_max_size_kb: int
+    github_account_daily_upload_limit_gb: float
     github_chunk_size_mb: int
     github_timeout_seconds: int
     github_max_retry: int
     github_backoff_seconds: int
+    github_upload_sleep_min_seconds: float
+    github_upload_sleep_max_seconds: float
     app_data_dir: Path
     app_state_dir: Path
     app_web_host: str
@@ -84,6 +132,10 @@ class AppConfig:
     def github_chunk_size_bytes(self) -> int:
         return min(self.github_chunk_size_mb, 95) * 1024 * 1024
 
+    @property
+    def github_account_daily_upload_limit_bytes(self) -> int:
+        return int(self.github_account_daily_upload_limit_gb * (1024**3))
+
 
 @dataclass(frozen=True)
 class RuntimeSecrets:
@@ -96,32 +148,72 @@ class RuntimeSecrets:
         return base64.urlsafe_b64decode(self.encryption_key + padding)
 
 
+def _discover_accounts() -> tuple[GitHubAccountConfig, ...]:
+    accounts: list[GitHubAccountConfig] = []
+    indices = set()
+    pattern = re.compile(r"^GITHUB_ACCOUNT_(\d+)_(TOKEN|OWNER)$")
+    for key in os.environ:
+        match = pattern.match(key)
+        if match:
+            indices.add(match.group(1))
+
+    for index in sorted(indices, key=int):
+        token = os.environ.get(f"GITHUB_ACCOUNT_{index}_TOKEN", "").strip()
+        owner = os.environ.get(f"GITHUB_ACCOUNT_{index}_OWNER", "").strip()
+        if token and owner:
+            accounts.append(GitHubAccountConfig(account_id=f"account_{index}", owner=owner, token=token))
+            continue
+        if token or owner:
+            raise ConfigError(f"La cuenta GitHub {index} debe definir TOKEN y OWNER.")
+
+    if accounts:
+        return tuple(accounts)
+
+    legacy_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    legacy_repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if legacy_token and legacy_repository:
+        owner, repository = _validate_repository_format(legacy_repository)
+        return (GitHubAccountConfig("legacy", owner, legacy_token, pinned_repository=repository),)
+
+    raise ConfigError(
+        "Falta al menos una cuenta GitHub. Define GITHUB_ACCOUNT_<n>_TOKEN y GITHUB_ACCOUNT_<n>_OWNER."
+    )
+
+
 def load_config() -> AppConfig:
     load_dotenv_file()
 
-    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
-    github_repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
     github_branch = os.environ.get("GITHUB_BRANCH", DEFAULT_BRANCH).strip() or DEFAULT_BRANCH
     github_uploads_prefix = (
         os.environ.get("GITHUB_UPLOADS_PREFIX", DEFAULT_UPLOADS_PREFIX).strip().strip("/")
         or DEFAULT_UPLOADS_PREFIX
     )
-
-    if not github_token:
-        raise ConfigError("Falta GITHUB_TOKEN.")
-    if not github_repository:
-        raise ConfigError("Falta GITHUB_REPOSITORY.")
-    _validate_repository_format(github_repository)
+    github_repository_prefix = (
+        os.environ.get("GITHUB_REPOSITORY_PREFIX", DEFAULT_REPOSITORY_PREFIX).strip().strip("-")
+        or DEFAULT_REPOSITORY_PREFIX
+    )
+    github_repository_private = _env_bool("GITHUB_REPOSITORY_PRIVATE", True)
+    github_repository_max_size_kb = _env_int("GITHUB_REPOSITORY_MAX_SIZE_KB")
+    github_account_daily_upload_limit_gb = _env_float("GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB")
+    github_upload_sleep_min_seconds = _env_float("GITHUB_UPLOAD_SLEEP_MIN_SECONDS", 0.0, allow_zero=True)
+    github_upload_sleep_max_seconds = _env_float("GITHUB_UPLOAD_SLEEP_MAX_SECONDS", 0.0, allow_zero=True)
+    if github_upload_sleep_min_seconds > github_upload_sleep_max_seconds:
+        raise ConfigError("GITHUB_UPLOAD_SLEEP_MIN_SECONDS no puede ser mayor que GITHUB_UPLOAD_SLEEP_MAX_SECONDS.")
 
     config = AppConfig(
-        github_token=github_token,
-        github_repository=github_repository,
+        github_accounts=_discover_accounts(),
         github_branch=github_branch,
         github_uploads_prefix=github_uploads_prefix,
+        github_repository_prefix=github_repository_prefix,
+        github_repository_private=github_repository_private,
+        github_repository_max_size_kb=github_repository_max_size_kb,
+        github_account_daily_upload_limit_gb=github_account_daily_upload_limit_gb,
         github_chunk_size_mb=_env_int("GITHUB_CHUNK_SIZE_MB", DEFAULT_CHUNK_SIZE_MB),
         github_timeout_seconds=_env_int("GITHUB_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
         github_max_retry=_env_int("GITHUB_MAX_RETRY", DEFAULT_MAX_RETRY),
         github_backoff_seconds=_env_int("GITHUB_BACKOFF_SECONDS", DEFAULT_BACKOFF_SECONDS),
+        github_upload_sleep_min_seconds=github_upload_sleep_min_seconds,
+        github_upload_sleep_max_seconds=github_upload_sleep_max_seconds,
         app_data_dir=Path(os.environ.get("APP_DATA_DIR", "/datos")).resolve(),
         app_state_dir=Path(os.environ.get("APP_STATE_DIR", "/state")).resolve(),
         app_web_host=os.environ.get("APP_WEB_HOST", "0.0.0.0").strip() or "0.0.0.0",
@@ -146,4 +238,3 @@ def generate_encryption_key() -> str:
 
 def generate_flask_secret() -> str:
     return secrets.token_hex(32)
-

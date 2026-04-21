@@ -68,6 +68,7 @@ class StateManager:
             state["config"] = default_config
             state.setdefault("tasks", self._default_state(default_config)["tasks"])
             state.setdefault("files", {})
+            state.setdefault("github_accounts", {})
             state.setdefault("created_at", utc_now_iso())
             return state
 
@@ -110,4 +111,5 @@ class StateManager:
                 },
             },
             "files": {},
+            "github_accounts": {},
         }

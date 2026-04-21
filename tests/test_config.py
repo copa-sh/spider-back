@@ -1,4 +1,20 @@
-from github_fs.config import generate_encryption_key, generate_pin
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+from github_fs.config import ConfigError, generate_encryption_key, generate_pin, load_config
+
+
+def _base_env(tmp_path) -> dict[str, str]:
+    return {
+        "GITHUB_ACCOUNT_1_TOKEN": "token-1",
+        "GITHUB_ACCOUNT_1_OWNER": "owner-1",
+        "GITHUB_REPOSITORY_MAX_SIZE_KB": "1024",
+        "GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB": "1",
+        "APP_STATE_DIR": str(tmp_path / "state"),
+    }
 
 
 def test_generate_pin_is_numeric():
@@ -15,3 +31,27 @@ def test_generate_encryption_key_decodes_to_32_bytes():
     decoded = base64.urlsafe_b64decode(key + padding)
     assert len(decoded) == 32
 
+
+def test_load_config_parses_numbered_accounts(tmp_path):
+    with patch.dict("os.environ", _base_env(tmp_path), clear=True):
+        config = load_config()
+    assert [item.account_id for item in config.github_accounts] == ["account_1"]
+    assert config.github_repository_prefix == "github-fs"
+    assert config.github_account_daily_upload_limit_bytes == 1024**3
+
+
+def test_load_config_rejects_invalid_sleep_range(tmp_path):
+    env = _base_env(tmp_path)
+    env["GITHUB_UPLOAD_SLEEP_MIN_SECONDS"] = "2"
+    env["GITHUB_UPLOAD_SLEEP_MAX_SECONDS"] = "1"
+    with patch.dict("os.environ", env, clear=True):
+        with pytest.raises(ConfigError):
+            load_config()
+
+
+def test_load_config_requires_complete_account(tmp_path):
+    env = _base_env(tmp_path)
+    env.pop("GITHUB_ACCOUNT_1_OWNER")
+    with patch.dict("os.environ", env, clear=True):
+        with pytest.raises(ConfigError):
+            load_config()
