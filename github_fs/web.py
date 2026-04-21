@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from functools import wraps
 from threading import Thread
+from typing import Any
 
 from flask import Flask, abort, redirect, render_template_string, request, session, url_for
 
+from .runtime import bootstrap_service
 from .service import AppService
 from .utils import add_seconds_iso
 
@@ -208,3 +210,17 @@ def _next_run_text(last_finished_at: str | None, interval_seconds: int) -> str:
     if not last_finished_at:
         return "pendiente de primera ejecucion"
     return add_seconds_iso(last_finished_at, interval_seconds)
+
+
+_default_app: Flask | None = None
+
+
+def get_default_app() -> Flask:
+    global _default_app
+    if _default_app is None:
+        _default_app = create_web_app(bootstrap_service())
+    return _default_app
+
+
+def app(environ: Any, start_response: Any):
+    return get_default_app()(environ, start_response)

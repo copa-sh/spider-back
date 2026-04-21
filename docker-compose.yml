@@ -3,8 +3,9 @@ services:
     build: .
     env_file:
       - .env
+    command: gunicorn -c gunicorn.conf.py -w ${GUNICORN_WORKERS:-4} -b 0.0.0.0:${APP_WEB_PORT:-8083} github_fs.web:app
     ports:
-      - "${APP_WEB_PORT:-8080}:8080"
+      - "${APP_WEB_PORT:-8083}:${APP_WEB_PORT:-8083}"
     volumes:
       - ${APP_DATA_BIND:-/mnt/datos/timeline}:${APP_DATA_DIR:-/datos}:ro
       - app-state:${APP_STATE_DIR:-/state}
@@ -12,4 +13,3 @@ services:
 
 volumes:
   app-state:
-

@@ -10,7 +10,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 8080
+EXPOSE 8083
 
-CMD ["python", "-m", "github_fs.main", "daemon"]
-
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "-w", "4", "-b", "0.0.0.0:8083", "github_fs.web:app"]

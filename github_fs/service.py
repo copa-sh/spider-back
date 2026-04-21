@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import random
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -89,6 +91,10 @@ class AppService:
         }
         self.account_by_id = {account.account_id: account for account in config.github_accounts}
         self._task_locks = {"sync": threading.Lock(), "verify": threading.Lock()}
+        self._task_lock_paths = {
+            "sync": self.config.app_state_dir / "sync.lock",
+            "verify": self.config.app_state_dir / "verify.lock",
+        }
         self._choose = chooser or random.choice
         self._sleep_sampler = sleep_sampler or random.uniform
         self._sleeper = sleeper or time.sleep
@@ -105,27 +111,32 @@ class AppService:
         return self._run_task("verify", self._verify_impl)
 
     def _run_task(self, task_name: str, callback) -> TaskResult:
-        lock = self._task_locks[task_name]
-        if not lock.acquire(blocking=False):
+        process_lock = self._task_locks[task_name]
+        if not process_lock.acquire(blocking=False):
             state = self.get_state()
             return TaskResult(False, state["tasks"][task_name].get("last_summary", {}), "Task already running")
 
         try:
-            state = self.state_manager.load(self.default_config)
-            task = state["tasks"][task_name]
-            task["running"] = True
-            task["last_started_at"] = utc_now_iso()
-            task["last_error"] = None
-            self.state_manager.save(state)
+            with self._acquire_task_file_lock(task_name) as acquired:
+                if not acquired:
+                    state = self.get_state()
+                    return TaskResult(False, state["tasks"][task_name].get("last_summary", {}), "Task already running")
 
-            result = callback(state)
-            state["tasks"][task_name]["running"] = False
-            state["tasks"][task_name]["last_finished_at"] = utc_now_iso()
-            state["tasks"][task_name]["last_result"] = "success" if result.ok else "error"
-            state["tasks"][task_name]["last_error"] = result.error
-            state["tasks"][task_name]["last_summary"] = result.summary
-            self.state_manager.save(state)
-            return result
+                state = self.state_manager.load(self.default_config)
+                task = state["tasks"][task_name]
+                task["running"] = True
+                task["last_started_at"] = utc_now_iso()
+                task["last_error"] = None
+                self.state_manager.save(state)
+
+                result = callback(state)
+                state["tasks"][task_name]["running"] = False
+                state["tasks"][task_name]["last_finished_at"] = utc_now_iso()
+                state["tasks"][task_name]["last_result"] = "success" if result.ok else "error"
+                state["tasks"][task_name]["last_error"] = result.error
+                state["tasks"][task_name]["last_summary"] = result.summary
+                self.state_manager.save(state)
+                return result
         except Exception as exc:
             state = self.state_manager.load(self.default_config)
             state["tasks"][task_name]["running"] = False
@@ -136,7 +147,23 @@ class AppService:
             self.state_manager.save(state)
             return TaskResult(False, {}, str(exc))
         finally:
-            lock.release()
+            process_lock.release()
+
+    @contextmanager
+    def _acquire_task_file_lock(self, task_name: str):
+        lock_path = self._task_lock_paths[task_name]
+        lock_path.touch(exist_ok=True)
+        with lock_path.open("r+", encoding="utf-8") as lock_file:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+
+            try:
+                yield True
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _sync_impl(self, state: dict[str, Any]) -> TaskResult:
         if not self.config.app_data_dir.exists():

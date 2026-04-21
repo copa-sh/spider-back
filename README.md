@@ -93,6 +93,10 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+Esto levanta un solo servicio Docker:
+
+- `app`: web WSGI real con `gunicorn`, y el scheduler de `sync` y `verify` corre dentro del proceso master de Gunicorn
+
 4. Si no definiste PIN, consulta logs:
 
 ```bash
@@ -118,15 +122,22 @@ La home muestra últimas ejecuciones y resumen de cuotas/repos por cuenta.
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -r requirements-dev.txt
-python3 -m github_fs.main daemon
+pip install -r requirements.txt
+python3 -m github_fs.main web-dev
 ```
 
 Comandos auxiliares:
 
 ```bash
+python3 -m github_fs.main scheduler
 python3 -m github_fs.main run-once-sync
 python3 -m github_fs.main run-once-verify
+```
+
+Produccion WSGI:
+
+```bash
+gunicorn -c gunicorn.conf.py -w 4 -b 0.0.0.0:8083 github_fs.web:app
 ```
 
 Tests:
