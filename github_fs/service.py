@@ -179,13 +179,18 @@ class AppService:
             raise ServiceError(f"No existe el directorio de datos: {self.config.app_data_dir}")
 
         self._ensure_github_accounts_state(state)
+        LOGGER.info("sync escaneando directorio=%s", self.config.app_data_dir)
         files_state = state["files"]
         discovered_paths: set[str] = set()
         changed_files: list[tuple[str, Path, str, int, int, str]] = []
+        scanned_files = 0
+        unchanged_files = 0
+        last_scan_log_at = time.monotonic()
 
         for file_path in iter_files(self.config.app_data_dir):
             rel_path = rel_path_str(self.config.app_data_dir, file_path)
             discovered_paths.add(rel_path)
+            scanned_files += 1
             file_id = stable_file_id(rel_path)
             stat = file_path.stat()
             size = stat.st_size
@@ -200,9 +205,28 @@ class AppService:
                 entry["source_sha256"] = source_sha256
                 entry["present"] = True
                 entry["last_seen_at"] = utc_now_iso()
+                unchanged_files += 1
+                if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
+                    LOGGER.info(
+                        "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
+                        scanned_files,
+                        len(changed_files),
+                        unchanged_files,
+                        rel_path,
+                    )
+                    last_scan_log_at = time.monotonic()
                 continue
 
             changed_files.append((file_id, file_path, rel_path, size, mtime_ns, source_sha256))
+            if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
+                LOGGER.info(
+                    "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
+                    scanned_files,
+                    len(changed_files),
+                    unchanged_files,
+                    rel_path,
+                )
+                last_scan_log_at = time.monotonic()
 
         LOGGER.info(
             "sync analizado: %s archivos detectados, %s pendientes de subida, %s ya estaban al dia.",
