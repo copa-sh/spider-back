@@ -1,6 +1,6 @@
 # github-fs
 
-Daemon que lee `/datos` en solo lectura, cifra archivos, los reparte entre varias cuentas GitHub y verifica periódicamente la integridad reconstruyendo cada versión desde GitHub.
+Daemon que lee `/datos` en solo lectura, cifra archivos, los reparte entre varias cuentas GitHub y verifica periódicamente la integridad reconstruyendo desde GitHub la ultima version activa de cada archivo presente en disco.
 
 ## Qué hace
 
@@ -9,7 +9,7 @@ Daemon que lee `/datos` en solo lectura, cifra archivos, los reparte entre varia
 - Elige aleatoriamente una cuenta GitHub con cuota diaria disponible.
 - Elige aleatoriamente un repositorio gestionado por la app con capacidad disponible o crea uno nuevo automáticamente.
 - Guarda en `/state/index.json` en qué cuenta y repo quedó cada versión.
-- Verifica integridad descargando los chunks cifrados con el token correcto de su cuenta de origen.
+- Verifica integridad de la ultima version activa descargando los chunks cifrados con el token correcto de su cuenta de origen.
 - Expone una web mínima con PIN para ver tareas, archivos, cuentas y repos gestionados.
 
 ## Variables de entorno
@@ -137,7 +137,7 @@ python3 -m github_fs.main run-once-verify
 Produccion WSGI:
 
 ```bash
-gunicorn -c gunicorn.conf.py -w 4 -b 0.0.0.0:8083 github_fs.web:app
+gunicorn -c gunicorn.conf.py -w 4 -b 0.0.0.0:8080 github_fs.web:app
 ```
 
 Tests:
