@@ -118,7 +118,7 @@ def make_service(tmp_path: Path, *, daily_limit_gb: float = 1, repo_limit_kb: in
 def test_sync_verify_and_repo_metadata_are_persisted(tmp_path):
     service, data_dir, sampled_sleeps = make_service(tmp_path)
     sample = data_dir / "archivo.txt"
-    sample.write_text("hola", encoding="utf-8")
+    sample.write_bytes(b"\x00\xffgocryptfs-ciphertext\x10\x11")
 
     sync = service.run_sync()
     assert sync.ok is True
@@ -135,6 +135,7 @@ def test_sync_verify_and_repo_metadata_are_persisted(tmp_path):
     assert verify.ok is True
     state = service.get_state()
     assert state["files"][file_id]["last_verification"]["account_id"] == "account_1"
+    assert state["files"][file_id]["last_verification"]["remote_sha256"] == state["files"][file_id]["source_sha256"]
 
 
 def test_creates_new_repository_when_existing_one_is_full(tmp_path):

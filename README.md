@@ -1,15 +1,18 @@
 # github-fs
 
-Daemon que lee `/datos` en solo lectura, cifra archivos, los reparte entre varias cuentas GitHub y verifica periódicamente la integridad reconstruyendo desde GitHub la ultima version activa de cada archivo presente en disco.
+Daemon que lee `/datos` en solo lectura, aplica una segunda capa de cifrado a cada archivo, los reparte entre varias cuentas GitHub y verifica periódicamente la integridad reconstruyendo desde GitHub la ultima version activa de cada archivo presente en disco.
+
+Si montas `gocryptfs`, `/datos` debe apuntar al directorio ya cifrado que expone `gocryptfs` por debajo. La app no descifra ese contenido local: lo vuelve a cifrar para GitHub y, en verificacion, descifra lo que guardo en GitHub para compararlo con los bytes locales cifrados.
 
 ## Qué hace
 
 - Detecta archivos nuevos o modificados por hash.
+- Trata el contenido local como bytes opacos, por ejemplo el backend cifrado de `gocryptfs`.
 - Cifra cada archivo con AES-256-GCM y lo divide en chunks.
 - Elige aleatoriamente una cuenta GitHub con cuota diaria disponible.
 - Elige aleatoriamente un repositorio gestionado por la app con capacidad disponible o crea uno nuevo automáticamente.
 - Guarda en `/state/index.json` en qué cuenta y repo quedó cada versión.
-- Verifica integridad de la ultima version activa descargando los chunks cifrados con el token correcto de su cuenta de origen.
+- Verifica integridad de la ultima version activa descargando los chunks cifrados con el token correcto de su cuenta de origen y comparando el resultado con el fichero local cifrado.
 - Expone una web mínima con PIN para ver tareas, archivos, cuentas y repos gestionados.
 
 ## Variables de entorno
