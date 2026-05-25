@@ -112,10 +112,11 @@ Rutas disponibles:
 - `GET /`
 - `GET /files`
 - `GET /files/<file_id>`
+- `GET /logs`
 - `POST /actions/sync`
 - `POST /actions/verify`
 
-La home muestra últimas ejecuciones y resumen de cuotas/repos por cuenta.
+La home muestra ultimas ejecuciones, resumen de cuotas/repos por cuenta y un enlace a los logs persistidos en `/state/logs/github-fs.log`.
 
 ## Desarrollo
 

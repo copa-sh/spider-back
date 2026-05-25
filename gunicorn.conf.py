@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 
-from github_fs.runtime import bootstrap_service, start_scheduler_threads, stop_scheduler_threads
+from github_fs.runtime import bootstrap_service, configure_file_logging, start_scheduler_threads, stop_scheduler_threads
 
 
 _scheduler_threads = None
+_log_path = Path(os.environ.get("APP_STATE_DIR", "/state")) / "logs" / "github-fs.log"
 
 accesslog = "-"
 errorlog = "-"
@@ -18,6 +21,7 @@ def _configure_app_logging(gunicorn_logger):
     app_logger.handlers = gunicorn_logger.handlers
     app_logger.setLevel(gunicorn_logger.level)
     app_logger.propagate = False
+    configure_file_logging(_log_path)
 
 
 def on_starting(server):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import threading
 
 from .config import load_config
@@ -9,6 +10,27 @@ from .state import StateManager
 
 
 LOGGER = logging.getLogger("github-fs")
+LOG_FORMAT = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+
+
+def configure_file_logging(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _attach_file_handler(LOGGER, log_path)
+
+
+def _attach_file_handler(logger: logging.Logger, log_path: Path) -> None:
+    resolved_path = log_path.resolve()
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            try:
+                if Path(handler.baseFilename).resolve() == resolved_path:
+                    return
+            except OSError:
+                continue
+
+    handler = logging.FileHandler(resolved_path, encoding="utf-8")
+    handler.setFormatter(LOG_FORMAT)
+    logger.addHandler(handler)
 
 
 class SchedulerThread(threading.Thread):
@@ -29,6 +51,7 @@ class SchedulerThread(threading.Thread):
 
 def bootstrap_service() -> AppService:
     config = load_config()
+    configure_file_logging(config.app_state_dir / "logs" / "github-fs.log")
     state_manager = StateManager(config.app_state_dir)
     secrets, generated = state_manager.bootstrap_secrets(config.app_web_pin, config.app_encryption_key)
     if generated["encryption_key"]:

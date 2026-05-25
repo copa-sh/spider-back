@@ -225,3 +225,22 @@ def test_web_login_and_manual_actions(tmp_path):
 
     trigger = client.post("/actions/verify")
     assert trigger.status_code == 302
+
+
+def test_web_logs_view_reads_persisted_log_file(tmp_path):
+    service, _, _ = make_service(tmp_path)
+    log_path = service.config.app_state_dir / "logs" / "github-fs.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "2026-05-25 10:00:00 INFO github-fs primero\n2026-05-25 10:00:01 WARNING github-fs segundo\n",
+        encoding="utf-8",
+    )
+
+    app = create_web_app(service)
+    client = app.test_client()
+    client.post("/login", data={"pin": "12345678"})
+
+    response = client.get("/logs?lines=1")
+    assert response.status_code == 200
+    assert b"segundo" in response.data
+    assert b"primero" not in response.data

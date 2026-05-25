@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import wraps
+from pathlib import Path
 from threading import Thread
 from typing import Any
 
@@ -43,6 +44,7 @@ HOME_TEMPLATE = """
       <button type="submit">Lanzar verificacion</button>
     </form>
     <p><a href="{{ url_for('files') }}">Ver archivos</a></p>
+    <p><a href="{{ url_for('logs') }}">Ver logs</a></p>
     <p><a href="{{ url_for('logout') }}">Salir</a></p>
   </body>
 </html>
@@ -111,6 +113,24 @@ FILE_TEMPLATE = """
       </li>
       {% endfor %}
     </ul>
+  </body>
+</html>
+"""
+
+
+LOGS_TEMPLATE = """
+<!doctype html>
+<html lang="es">
+  <body>
+    <h1>Logs</h1>
+    <p><a href="{{ url_for('home') }}">Volver</a></p>
+    <p><strong>Fuente:</strong> {{ log_path }}</p>
+    <p><strong>Lineas mostradas:</strong> {{ lines }}</p>
+    {% if error %}
+      <p>{{ error }}</p>
+    {% else %}
+      <pre style="white-space: pre-wrap;">{{ content }}</pre>
+    {% endif %}
   </body>
 </html>
 """
@@ -191,6 +211,21 @@ def create_web_app(service: AppService) -> Flask:
             abort(404)
         return render_template_string(FILE_TEMPLATE, file=file_entry)
 
+    @app.get("/logs")
+    @require_login
+    def logs():
+        requested_lines = request.args.get("lines", "200")
+        line_count = _parse_line_count(requested_lines)
+        log_path = service.config.app_state_dir / "logs" / "github-fs.log"
+        content, error = _read_tail(log_path, line_count)
+        return render_template_string(
+            LOGS_TEMPLATE,
+            content=content,
+            error=error,
+            lines=line_count,
+            log_path=log_path,
+        )
+
     @app.post("/actions/sync")
     @require_login
     def trigger_sync():
@@ -210,6 +245,27 @@ def _next_run_text(last_finished_at: str | None, interval_seconds: int) -> str:
     if not last_finished_at:
         return "pendiente de primera ejecucion"
     return add_seconds_iso(last_finished_at, interval_seconds)
+
+
+def _parse_line_count(raw_value: str) -> int:
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return 200
+    return min(max(parsed, 1), 1000)
+
+
+def _read_tail(log_path: Path, line_count: int) -> tuple[str, str | None]:
+    if not log_path.exists():
+        return "", f"No existe el archivo de logs en {log_path}."
+
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        return "", f"No se pudo leer el archivo de logs: {exc}"
+
+    tail = lines[-line_count:]
+    return "\n".join(tail), None
 
 
 _default_app: Flask | None = None
