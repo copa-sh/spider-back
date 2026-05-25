@@ -545,6 +545,7 @@ class AppService:
             len(chunk_items),
             estimated_upload_bytes,
         )
+        client.ensure_branch_initialized(target.owner, target.repository, target.branch)
 
         version_id = utc_now_compact()
         remote_prefix = f"{self.config.github_uploads_prefix}/{file_id}/{version_id}"

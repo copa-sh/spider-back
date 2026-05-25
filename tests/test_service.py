@@ -25,6 +25,7 @@ class FakeGitHubClient:
         self.repositories: dict[str, FakeRepositoryInfo] = {}
         self.commits: list[tuple[str, str]] = []
         self.created_repositories: list[str] = []
+        self.initialized_branches: set[tuple[str, str]] = set()
 
     def list_managed_repositories(self, owner: str, prefix: str):
         return sorted([repo for repo in self.repositories.values() if repo.name.startswith(prefix)], key=lambda item: item.name)
@@ -37,6 +38,10 @@ class FakeGitHubClient:
         self.repositories[name] = info
         self.created_repositories.append(name)
         return info
+
+    def ensure_branch_initialized(self, owner: str, repo: str, branch: str):
+        self.initialized_branches.add((repo, branch))
+        self.repositories.setdefault(repo, FakeRepositoryInfo(owner, repo))
 
     def create_blob(self, owner: str, repo: str, payload: bytes) -> str:
         sha = hashlib.sha1(payload).hexdigest()
@@ -130,6 +135,7 @@ def test_sync_verify_and_repo_metadata_are_persisted(tmp_path):
     assert version["repository"] == "github-fs-0001"
     assert state["github_accounts"]["account_1"]["repositories"]["github-fs-0001"]["last_known_size_kb"] >= 1
     assert sampled_sleeps
+    assert ("github-fs-0001", "main") in service.github_clients["account_1"].initialized_branches
 
     verify = service.run_verify()
     assert verify.ok is True
