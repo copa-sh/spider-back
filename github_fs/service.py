@@ -105,6 +105,7 @@ class AppService:
 
     def get_state(self) -> dict[str, Any]:
         state = self.state_manager.snapshot(self.default_config)
+        self._refresh_task_running_flags(state)
         self._augment_state_for_web(state)
         return state
 
@@ -173,6 +174,24 @@ class AppService:
                 yield True
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _refresh_task_running_flags(self, state: dict[str, Any]) -> None:
+        tasks = state.setdefault("tasks", {})
+        for task_name in ("sync", "verify"):
+            task_state = tasks.setdefault(task_name, {})
+            task_state["running"] = self._is_task_file_lock_held(task_name)
+
+    def _is_task_file_lock_held(self, task_name: str) -> bool:
+        lock_path = self._task_lock_paths[task_name]
+        lock_path.touch(exist_ok=True)
+        with lock_path.open("r+", encoding="utf-8") as lock_file:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            return False
 
     def _sync_impl(self, state: dict[str, Any]) -> TaskResult:
         if not self.config.app_data_dir.exists():

@@ -244,3 +244,12 @@ def test_web_logs_view_reads_persisted_log_file(tmp_path):
     assert response.status_code == 200
     assert b"segundo" in response.data
     assert b"primero" not in response.data
+
+
+def test_state_reflects_when_sync_lock_is_held(tmp_path):
+    service, _, _ = make_service(tmp_path)
+
+    with service._acquire_task_file_lock("sync") as acquired:
+        assert acquired is True
+        state = service.get_state()
+        assert state["tasks"]["sync"]["running"] is True
