@@ -18,6 +18,7 @@ def test_load_initial_state(tmp_path):
     state = manager.load({"repository": "owner/repo"})
     assert state["files"] == {}
     assert state["tasks"]["sync"]["last_result"] == "never"
+    assert state["tasks"]["sync_by_name"]["last_result"] == "never"
 
 
 def test_load_replaces_effective_config(tmp_path):

@@ -7,6 +7,7 @@ Si montas `gocryptfs`, `/datos` debe apuntar al directorio ya cifrado que expone
 ## Qué hace
 
 - Detecta archivos nuevos o modificados por hash.
+- Tiene una sincronizacion ligera por nombre para asumir que los archivos ya conocidos no cambiaron y evitar re-hashearlos.
 - Trata el contenido local como bytes opacos, por ejemplo el backend cifrado de `gocryptfs`.
 - Cifra cada archivo con AES-256-GCM y lo divide en chunks.
 - Elige aleatoriamente una cuenta GitHub con cuota diaria disponible.
@@ -44,7 +45,7 @@ Variables globales relevantes:
 - `APP_STATE_DIR=/state`
 - `APP_WEB_HOST=0.0.0.0`
 - `APP_WEB_PORT=8080`
-- `APP_SYNC_INTERVAL_SECONDS=604800`
+- `APP_SYNC_INTERVAL_SECONDS=604800` - ejecuta la sync programada ligera por nombre (`sync_by_name`)
 - `APP_VERIFY_INTERVAL_SECONDS=604800`
 - `APP_WEB_PIN`
 - `APP_ENCRYPTION_KEY`
@@ -64,6 +65,7 @@ Si `APP_WEB_PIN` o `APP_ENCRYPTION_KEY` no están definidos, se generan automát
 En `/state/index.json` se guardan:
 
 - tareas de sync y verify
+- `sync_by_name` es la sync automatica periodica; `sync` queda como accion manual completa
 - catálogo de archivos y versiones
 - bloque `github_accounts` con:
   - owner por cuenta
@@ -117,6 +119,7 @@ Rutas disponibles:
 - `GET /files/<file_id>`
 - `GET /logs`
 - `POST /actions/sync`
+- `POST /actions/sync-by-name`
 - `POST /actions/verify`
 
 La home muestra ultimas ejecuciones, resumen de cuotas/repos por cuenta y un enlace a los logs persistidos en `/state/logs/github-fs.log`.
@@ -135,6 +138,7 @@ Comandos auxiliares:
 ```bash
 python3 -m github_fs.main scheduler
 python3 -m github_fs.main run-once-sync
+python3 -m github_fs.main run-once-sync-by-name
 python3 -m github_fs.main run-once-verify
 ```
 

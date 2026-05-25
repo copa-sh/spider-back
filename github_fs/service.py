@@ -94,9 +94,10 @@ class AppService:
             for account in config.github_accounts
         }
         self.account_by_id = {account.account_id: account for account in config.github_accounts}
-        self._task_locks = {"sync": threading.Lock(), "verify": threading.Lock()}
+        self._task_locks = {"sync": threading.Lock(), "sync_by_name": threading.Lock(), "verify": threading.Lock()}
         self._task_lock_paths = {
             "sync": self.config.app_state_dir / "sync.lock",
+            "sync_by_name": self.config.app_state_dir / "sync_by_name.lock",
             "verify": self.config.app_state_dir / "verify.lock",
         }
         self._choose = chooser or random.choice
@@ -111,6 +112,9 @@ class AppService:
 
     def run_sync(self) -> TaskResult:
         return self._run_task("sync", self._sync_impl)
+
+    def run_sync_by_name(self) -> TaskResult:
+        return self._run_task("sync_by_name", self._sync_by_name_impl)
 
     def run_verify(self) -> TaskResult:
         return self._run_task("verify", self._verify_impl)
@@ -177,7 +181,7 @@ class AppService:
 
     def _refresh_task_running_flags(self, state: dict[str, Any]) -> None:
         tasks = state.setdefault("tasks", {})
-        for task_name in ("sync", "verify"):
+        for task_name in ("sync", "sync_by_name", "verify"):
             task_state = tasks.setdefault(task_name, {})
             task_state["running"] = self._is_task_file_lock_held(task_name)
 
@@ -311,6 +315,132 @@ class AppService:
         self.state_manager.save(state)
         summary = {
             "scanned_files": len(discovered_paths),
+            "uploaded_files": uploaded_files,
+            "failed_files": failed_files,
+            "uploaded_bytes": uploaded_bytes,
+            "missing_files": sum(1 for entry in files_state.values() if not entry.get("present")),
+        }
+        return TaskResult(failed_files == 0, summary, None if failed_files == 0 else f"{failed_files} archivos con error")
+
+    def _sync_by_name_impl(self, state: dict[str, Any]) -> TaskResult:
+        if not self.config.app_data_dir.exists():
+            raise ServiceError(f"No existe el directorio de datos: {self.config.app_data_dir}")
+
+        self._ensure_github_accounts_state(state)
+        LOGGER.info("sync por nombre escaneando directorio=%s", self.config.app_data_dir)
+        files_state = state["files"]
+        discovered_paths: set[str] = set()
+        new_files: list[tuple[str, Path, str, int, int, str]] = []
+        scanned_files = 0
+        skipped_files = 0
+        last_scan_log_at = time.monotonic()
+
+        for file_path in iter_files(self.config.app_data_dir):
+            rel_path = rel_path_str(self.config.app_data_dir, file_path)
+            discovered_paths.add(rel_path)
+            scanned_files += 1
+            file_id = stable_file_id(rel_path)
+            stat = file_path.stat()
+            size = stat.st_size
+            mtime_ns = stat.st_mtime_ns
+
+            entry = files_state.get(file_id)
+            active_version = self._get_active_version(entry) if entry else None
+            if active_version and entry.get("present"):
+                entry["size"] = size
+                entry["mtime_ns"] = mtime_ns
+                entry["present"] = True
+                entry["last_seen_at"] = utc_now_iso()
+                skipped_files += 1
+                if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
+                    LOGGER.info(
+                        "sync por nombre progreso: revisados=%s nuevos=%s omitidos=%s ultimo=%s",
+                        scanned_files,
+                        len(new_files),
+                        skipped_files,
+                        rel_path,
+                    )
+                    last_scan_log_at = time.monotonic()
+                continue
+
+            source_sha256 = sha256_file(file_path)
+            new_files.append((file_id, file_path, rel_path, size, mtime_ns, source_sha256))
+            if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
+                LOGGER.info(
+                    "sync por nombre progreso: revisados=%s nuevos=%s omitidos=%s ultimo=%s",
+                    scanned_files,
+                    len(new_files),
+                    skipped_files,
+                    rel_path,
+                )
+                last_scan_log_at = time.monotonic()
+
+        LOGGER.info(
+            "sync por nombre analizado: %s archivos detectados, %s nuevos pendientes de subida, %s omitidos por existir ya en el catalogo.",
+            len(discovered_paths),
+            len(new_files),
+            skipped_files,
+        )
+
+        for entry in files_state.values():
+            if entry["path"] not in discovered_paths:
+                entry["present"] = False
+                entry["last_seen_at"] = utc_now_iso()
+
+        uploaded_files = 0
+        failed_files = 0
+        uploaded_bytes = 0
+
+        for file_id, file_path, rel_path, size, mtime_ns, source_sha256 in new_files:
+            entry = files_state.setdefault(
+                file_id,
+                {
+                    "file_id": file_id,
+                    "path": rel_path,
+                    "versions": [],
+                    "active_version_id": None,
+                    "last_verification": None,
+                    "last_error": None,
+                },
+            )
+            try:
+                LOGGER.info("sync por nombre subiendo archivo path=%s size=%sB", rel_path, size)
+                version = self._upload_file_version(state, file_id, file_path, rel_path, size, mtime_ns, source_sha256)
+                entry["path"] = rel_path
+                entry["present"] = True
+                entry["size"] = size
+                entry["mtime_ns"] = mtime_ns
+                entry["source_sha256"] = source_sha256
+                entry["last_seen_at"] = utc_now_iso()
+                entry.setdefault("versions", []).append(version)
+                entry["active_version_id"] = version["version_id"]
+                entry["last_error"] = None
+                uploaded_files += 1
+                uploaded_bytes += version["uploaded_bytes"]
+                LOGGER.info(
+                    "sync por nombre archivo subido path=%s cuenta=%s repo=%s version=%s bytes=%s",
+                    rel_path,
+                    version["account_id"],
+                    version["repository"],
+                    version["version_id"],
+                    version["uploaded_bytes"],
+                )
+            except Exception as exc:
+                entry["path"] = rel_path
+                entry["present"] = True
+                entry["size"] = size
+                entry["mtime_ns"] = mtime_ns
+                entry["source_sha256"] = source_sha256
+                entry["last_seen_at"] = utc_now_iso()
+                entry["last_error"] = str(exc)
+                failed_files += 1
+                LOGGER.exception("sync por nombre error subiendo path=%s", rel_path)
+
+        self.state_manager.save(state)
+        summary = {
+            "mode": "name-based",
+            "scanned_files": len(discovered_paths),
+            "skipped_files": skipped_files,
             "uploaded_files": uploaded_files,
             "failed_files": failed_files,
             "uploaded_bytes": uploaded_bytes,

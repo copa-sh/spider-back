@@ -138,6 +138,38 @@ def test_sync_verify_and_repo_metadata_are_persisted(tmp_path):
     assert state["files"][file_id]["last_verification"]["remote_sha256"] == state["files"][file_id]["source_sha256"]
 
 
+def test_sync_by_name_skips_known_files_without_hashing_them(tmp_path, monkeypatch):
+    service, data_dir, _ = make_service(tmp_path)
+    known = data_dir / "archivo1.jpg"
+    known.write_bytes(b"contenido conocido")
+
+    first_sync = service.run_sync()
+    assert first_sync.ok is True
+
+    new_file = data_dir / "archivo2.jpg"
+    new_file.write_bytes(b"contenido nuevo")
+
+    hashed_paths: list[str] = []
+
+    def fake_sha256_file(path, chunk_size: int = 1024 * 1024):
+        hashed_paths.append(path.name)
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr("github_fs.service.sha256_file", fake_sha256_file)
+
+    sync = service.run_sync_by_name()
+    assert sync.ok is True
+    assert sync.summary["skipped_files"] == 1
+    assert sync.summary["uploaded_files"] == 1
+    assert "archivo1.jpg" not in hashed_paths
+    assert "archivo2.jpg" in hashed_paths
+
+    state = service.get_state()
+    assert len(state["files"]) == 2
+    new_entry = state["files"][next(file_id for file_id, entry in state["files"].items() if entry["path"] == "archivo2.jpg")]
+    assert new_entry["versions"][0]["repository"] == "github-fs-0001"
+
+
 def test_creates_new_repository_when_existing_one_is_full(tmp_path):
     service, data_dir, _ = make_service(tmp_path, repo_limit_kb=1)
     client = service.github_clients["account_1"]

@@ -100,6 +100,15 @@ class StateManager:
                     "last_manual_trigger_at": None,
                     "running": False,
                 },
+                "sync_by_name": {
+                    "last_started_at": None,
+                    "last_finished_at": None,
+                    "last_result": "never",
+                    "last_error": None,
+                    "last_summary": {},
+                    "last_manual_trigger_at": None,
+                    "running": False,
+                },
                 "verify": {
                     "last_started_at": None,
                     "last_finished_at": None,
