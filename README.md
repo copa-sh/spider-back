@@ -85,7 +85,7 @@ En `/state/index.json` se guardan:
 cp .env.example .env
 ```
 
-2. Ajusta tus cuentas GitHub, límites y bind mount de datos.
+2. Ajusta tus cuentas GitHub, límites y bind mounts de datos y estado.
 
 3. Arranca:
 

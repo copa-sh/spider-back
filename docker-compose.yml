@@ -8,5 +8,5 @@ services:
       - "${APP_WEB_PORT:-8080}:${APP_WEB_PORT:-8080}"
     volumes:
       - ${APP_DATA_BIND:-/mnt/datos/timeline}:${APP_DATA_DIR:-/datos}:ro
-      - ./state:${APP_STATE_DIR:-/state}
+      - ${APP_STATE_BIND:-./state}:${APP_STATE_DIR:-/state}
     restart: unless-stopped
