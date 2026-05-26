@@ -582,81 +582,88 @@ class AppService:
             len(chunk_items),
             estimated_upload_bytes,
         )
-        client.ensure_branch_initialized(target.owner, target.repository, target.branch)
+        try:
+            client.ensure_branch_initialized(target.owner, target.repository, target.branch)
 
-        version_id = utc_now_compact()
-        remote_prefix = f"{self.config.github_uploads_prefix}/{file_id}/{version_id}"
-        tree_entries: list[dict[str, Any]] = []
-        chunks_payload: list[dict[str, Any]] = []
-        uploaded_bytes = 0
+            version_id = utc_now_compact()
+            remote_prefix = f"{self.config.github_uploads_prefix}/{file_id}/{version_id}"
+            tree_entries: list[dict[str, Any]] = []
+            chunks_payload: list[dict[str, Any]] = []
+            uploaded_bytes = 0
 
-        for chunk_index, chunk in chunk_items:
-            LOGGER.info(
-                "sync subiendo chunk path=%s chunk=%s/%s size=%sB repo=%s",
-                rel_path,
-                chunk_index + 1,
-                len(chunk_items),
-                len(chunk),
-                target.repository,
-            )
-            chunk_sha = client.create_blob(target.owner, target.repository, chunk)
+            for chunk_index, chunk in chunk_items:
+                LOGGER.info(
+                    "sync subiendo chunk path=%s chunk=%s/%s size=%sB repo=%s",
+                    rel_path,
+                    chunk_index + 1,
+                    len(chunk_items),
+                    len(chunk),
+                    target.repository,
+                )
+                chunk_sha = client.create_blob(target.owner, target.repository, chunk)
+                self._sleep_after_upload()
+                chunk_path = f"{remote_prefix}/chunk_{chunk_index:04d}.bin"
+                tree_entries.append({"path": chunk_path, "mode": "100644", "type": "blob", "sha": chunk_sha})
+                chunks_payload.append(
+                    {
+                        "index": chunk_index,
+                        "path": chunk_path,
+                        "raw_url": client.raw_url(target.owner, target.repository, target.branch, chunk_path),
+                        "sha256": sha256_bytes(chunk),
+                        "size": len(chunk),
+                        "repository": target.repository,
+                        "repository_owner": target.owner,
+                        "account_id": target.account_id,
+                    }
+                )
+                uploaded_bytes += len(chunk)
+
+            version_manifest: dict[str, Any] = {
+                "version": 1,
+                "file_id": file_id,
+                "path": rel_path,
+                "version_id": version_id,
+                "created_at": utc_now_iso(),
+                "plaintext_sha256": encrypted["plaintext_sha256"],
+                "ciphertext_sha256": encrypted["ciphertext_sha256"],
+                "size": size,
+                "mtime_ns": mtime_ns,
+                "source_sha256": source_sha256,
+                "repository_owner": target.owner,
+                "repository": target.repository,
+                "branch": target.branch,
+                "account_id": target.account_id,
+                "encryption": {
+                    "algorithm": encrypted["algorithm"],
+                    "nonce_b64": encrypted["nonce_b64"],
+                    "key_id": "state-default",
+                },
+                "chunks": chunks_payload,
+            }
+
+            manifest_bytes = json.dumps(version_manifest, ensure_ascii=False, indent=2).encode("utf-8")
+            self._assert_target_capacity(state, target, uploaded_bytes + len(manifest_bytes))
+            LOGGER.info("sync subiendo manifest path=%s size=%sB repo=%s", rel_path, len(manifest_bytes), target.repository)
+            manifest_sha = client.create_blob(target.owner, target.repository, manifest_bytes)
             self._sleep_after_upload()
-            chunk_path = f"{remote_prefix}/chunk_{chunk_index:04d}.bin"
-            tree_entries.append({"path": chunk_path, "mode": "100644", "type": "blob", "sha": chunk_sha})
-            chunks_payload.append(
-                {
-                    "index": chunk_index,
-                    "path": chunk_path,
-                    "raw_url": client.raw_url(target.owner, target.repository, target.branch, chunk_path),
-                    "sha256": sha256_bytes(chunk),
-                    "size": len(chunk),
-                    "repository": target.repository,
-                    "repository_owner": target.owner,
-                    "account_id": target.account_id,
-                }
+            manifest_path = f"{remote_prefix}/manifest.json"
+            tree_entries.append({"path": manifest_path, "mode": "100644", "type": "blob", "sha": manifest_sha})
+            uploaded_bytes += len(manifest_bytes)
+
+            commit_sha = client.commit_tree(
+                target.owner,
+                target.repository,
+                target.branch,
+                tree_entries,
+                f"github-fs sync {utc_now_iso()} ({rel_path})",
             )
-            uploaded_bytes += len(chunk)
-
-        version_manifest: dict[str, Any] = {
-            "version": 1,
-            "file_id": file_id,
-            "path": rel_path,
-            "version_id": version_id,
-            "created_at": utc_now_iso(),
-            "plaintext_sha256": encrypted["plaintext_sha256"],
-            "ciphertext_sha256": encrypted["ciphertext_sha256"],
-            "size": size,
-            "mtime_ns": mtime_ns,
-            "source_sha256": source_sha256,
-            "repository_owner": target.owner,
-            "repository": target.repository,
-            "branch": target.branch,
-            "account_id": target.account_id,
-            "encryption": {
-                "algorithm": encrypted["algorithm"],
-                "nonce_b64": encrypted["nonce_b64"],
-                "key_id": "state-default",
-            },
-            "chunks": chunks_payload,
-        }
-
-        manifest_bytes = json.dumps(version_manifest, ensure_ascii=False, indent=2).encode("utf-8")
-        self._assert_target_capacity(state, target, uploaded_bytes + len(manifest_bytes))
-        LOGGER.info("sync subiendo manifest path=%s size=%sB repo=%s", rel_path, len(manifest_bytes), target.repository)
-        manifest_sha = client.create_blob(target.owner, target.repository, manifest_bytes)
-        self._sleep_after_upload()
-        manifest_path = f"{remote_prefix}/manifest.json"
-        tree_entries.append({"path": manifest_path, "mode": "100644", "type": "blob", "sha": manifest_sha})
-        uploaded_bytes += len(manifest_bytes)
-
-        commit_sha = client.commit_tree(
-            target.owner,
-            target.repository,
-            target.branch,
-            tree_entries,
-            f"github-fs sync {utc_now_iso()} ({rel_path})",
-        )
-        LOGGER.info("sync commit creado path=%s repo=%s commit=%s", rel_path, target.repository, commit_sha)
+            LOGGER.info("sync commit creado path=%s repo=%s commit=%s", rel_path, target.repository, commit_sha)
+        except GitHubError as exc:
+            if self._handle_account_access_error(state, self.account_by_id[target.account_id], exc):
+                raise ServiceError(
+                    f"La cuenta {target.account_id} ha sido retirada del pool activo por permisos insuficientes."
+                ) from exc
+            raise
 
         self._record_uploaded_bytes(state, target.account_id, uploaded_bytes)
         self._bump_repository_size(state, target.account_id, target.repository, uploaded_bytes)
@@ -759,7 +766,14 @@ class AppService:
 
     def _refresh_managed_repositories(self, state: dict[str, Any], account: GitHubAccountConfig) -> list[RepositoryInfo]:
         client = self._client_for_account(account.account_id)
-        repositories = client.list_managed_repositories(account.owner, self.config.github_repository_prefix)
+        try:
+            repositories = client.list_managed_repositories(account.owner, self.config.github_repository_prefix)
+        except GitHubError as exc:
+            if self._handle_account_access_error(state, account, exc):
+                raise ServiceError(
+                    f"La cuenta {account.account_id} ha sido retirada del pool activo por permisos insuficientes."
+                ) from exc
+            raise
         account_state = self._account_state(state, account.account_id, owner=account.owner)
         known = account_state["repositories"]
         seen = set()
@@ -779,7 +793,14 @@ class AppService:
 
     def _refresh_repository_info(self, state: dict[str, Any], account: GitHubAccountConfig, repository: str) -> RepositoryInfo:
         client = self._client_for_account(account.account_id)
-        info = client.get_repository(account.owner, repository)
+        try:
+            info = client.get_repository(account.owner, repository)
+        except GitHubError as exc:
+            if self._handle_account_access_error(state, account, exc):
+                raise ServiceError(
+                    f"La cuenta {account.account_id} ha sido retirada del pool activo por permisos insuficientes."
+                ) from exc
+            raise
         repo_state = self._account_state(state, account.account_id, owner=account.owner)["repositories"].setdefault(repository, {})
         repo_state["name"] = repository
         repo_state["owner"] = account.owner
@@ -802,19 +823,11 @@ class AppService:
         try:
             info = client.create_repository(account.owner, candidate, self.config.github_repository_private)
         except GitHubError as exc:
+            if self._handle_account_access_error(state, account, exc):
+                raise ServiceError(
+                    f"La cuenta {account.account_id} ha sido retirada del pool activo por permisos insuficientes."
+                ) from exc
             message = str(exc)
-            if "HTTP 403" in message and "Resource not accessible by personal access token" in message:
-                alert_message = (
-                    f"El token GitHub de la cuenta {account.account_id} no puede crear repositorios en {account.owner}. "
-                    "Usa un token con permiso para administrarlos o configura un repositorio fijo existente."
-                )
-                self._mark_account_unavailable(
-                    state,
-                    account,
-                    code="repository_creation_forbidden",
-                    message=alert_message,
-                )
-                raise ServiceError(alert_message) from exc
             raise ServiceError(
                 f"No se pudo crear el repositorio {account.owner}/{candidate} para la cuenta {account.account_id}: {message}"
             ) from exc
@@ -853,6 +866,22 @@ class AppService:
         account_state["unavailable_reason"] = message
         account_state["unavailable_since"] = detected_at
         self._runtime_unavailable_accounts.add(account.account_id)
+
+    def _handle_account_access_error(self, state: dict[str, Any], account: GitHubAccountConfig, exc: Exception) -> bool:
+        message = str(exc)
+        if "HTTP 403" not in message or "Resource not accessible by personal access token" not in message:
+            return False
+        alert_message = (
+            f"La cuenta {account.account_id} ha sido retirada del pool activo: el token no puede acceder o "
+            f"administrar recursos en {account.owner}. Revisa permisos o sustituye la cuenta."
+        )
+        self._mark_account_unavailable(
+            state,
+            account,
+            code="personal_access_token_forbidden",
+            message=alert_message,
+        )
+        return True
 
     def _record_uploaded_bytes(self, state: dict[str, Any], account_id: str, uploaded_bytes: int) -> None:
         account_state = self._account_state(state, account_id)

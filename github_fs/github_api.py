@@ -133,7 +133,7 @@ class GitHubClient:
         return repositories
 
     def create_repository(self, owner: str, name: str, private: bool) -> RepositoryInfo:
-        payload = {"name": name, "private": private, "auto_init": False}
+        payload = {"name": name, "private": True, "auto_init": True}
         if owner == self.authenticated_login():
             response = self._request("POST", self._owner_url("user/repos"), json=payload)
         else:
@@ -143,7 +143,7 @@ class GitHubClient:
             owner=owner,
             name=body["name"],
             size_kb=int(body.get("size", 0)),
-            private=bool(body.get("private", private)),
+            private=bool(body.get("private", True)),
         )
 
     def ensure_branch_initialized(self, owner: str, repo: str, branch: str) -> None:

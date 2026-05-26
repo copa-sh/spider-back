@@ -28,8 +28,11 @@ class FakeGitHubClient:
         self.created_repositories: list[str] = []
         self.initialized_branches: set[tuple[str, str]] = set()
         self.create_repository_error: Exception | None = None
+        self.list_managed_repositories_error: Exception | None = None
 
     def list_managed_repositories(self, owner: str, prefix: str):
+        if self.list_managed_repositories_error:
+            raise self.list_managed_repositories_error
         return sorted([repo for repo in self.repositories.values() if repo.name.startswith(prefix)], key=lambda item: item.name)
 
     def get_repository(self, owner: str, repo: str):
@@ -296,8 +299,30 @@ def test_reports_actionable_error_when_token_cannot_create_repository(tmp_path):
     assert second_client.created_repositories == ["github-fs-0001"]
     account_1_state = state["github_accounts"]["account_1"]
     assert account_1_state["available"] is False
-    assert "no puede crear repositorios" in account_1_state["unavailable_reason"]
-    assert account_1_state["alerts"][0]["code"] == "repository_creation_forbidden"
+    assert "retirada del pool activo" in account_1_state["unavailable_reason"]
+    assert account_1_state["alerts"][0]["code"] == "personal_access_token_forbidden"
+
+
+def test_removes_account_from_active_pool_when_pat_cannot_access_repositories(tmp_path):
+    service, data_dir, _ = make_service(tmp_path)
+    blocked_client = service.github_clients["account_1"]
+    fallback_client = service.github_clients["account_2"]
+    blocked_client.list_managed_repositories_error = GitHubError(
+        'HTTP 403: {"message":"Resource not accessible by personal access token","status":"403"}'
+    )
+    (data_dir / "archivo.txt").write_text("hola", encoding="utf-8")
+
+    sync = service.run_full_sync()
+
+    assert sync.ok is True
+    state = service.get_state()
+    version = next(iter(state["files"].values()))["versions"][0]
+    assert version["account_id"] == "account_2"
+    assert fallback_client.created_repositories == ["github-fs-0001"]
+    account_1_state = state["github_accounts"]["account_1"]
+    assert account_1_state["available"] is False
+    assert account_1_state["alerts"][0]["code"] == "personal_access_token_forbidden"
+    assert "retirada del pool activo" in account_1_state["unavailable_reason"]
 
 
 def test_fails_when_all_accounts_are_over_daily_limit(tmp_path):
@@ -375,7 +400,7 @@ def test_home_shows_github_account_alerts_table(tmp_path):
     assert response.status_code == 200
     assert b"Alertas" in response.data
     assert b"owner-a (account_1)" in response.data
-    assert b"no puede crear repositorios" in response.data
+    assert b"retirada del pool activo" in response.data
 
 
 def test_web_logs_view_reads_persisted_log_file(tmp_path):
