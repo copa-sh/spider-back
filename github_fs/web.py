@@ -26,6 +26,8 @@ HOME_TEMPLATE = """
     <p><strong>Sync por nombre en curso:</strong> {{ "si" if state.tasks.sync_by_name.running else "no" }}</p>
     <p><strong>Verificacion en curso:</strong> {{ "si" if state.tasks.verify.running else "no" }}</p>
     <p><strong>Archivos presentes:</strong> {{ stats.present }}</p>
+    <p><strong>Archivos completos en GitHub:</strong> {{ stats.uploaded }}</p>
+    <p><strong>Archivos verificados:</strong> {{ stats.verified }}</p>
     <p><strong>Archivos ausentes:</strong> {{ stats.absent }}</p>
     <p><strong>Archivos con error:</strong> {{ stats.with_error }}</p>
     <p><strong>Total de versiones:</strong> {{ stats.total_versions }}</p>
@@ -230,10 +232,12 @@ def create_web_app(service: AppService) -> Flask:
         state = service.get_state()
         files = state["files"].values()
         stats = {
-            "present": sum(1 for item in files if item.get("present")),
-            "absent": sum(1 for item in files if not item.get("present")),
-            "with_error": sum(1 for item in files if item.get("last_error")),
-            "total_versions": sum(len(item.get("versions", [])) for item in files),
+          "present": sum(1 for item in files if item.get("present")),
+          "uploaded": sum(1 for item in files if item.get("active_version_id")),
+          "verified": sum(1 for item in files if item.get("last_verification", {}).get("ok") is True),
+          "absent": sum(1 for item in files if not item.get("present")),
+          "with_error": sum(1 for item in files if item.get("last_error")),
+          "total_versions": sum(len(item.get("versions", [])) for item in files),
         }
         next_sync = _next_run_text(state["tasks"]["sync"]["last_finished_at"], service.config.app_sync_interval_seconds)
         next_verify = _next_run_text(state["tasks"]["verify"]["last_finished_at"], service.config.app_verify_interval_seconds)
