@@ -108,6 +108,8 @@ class AppService:
         # live in-memory state while a task is running (used by web UI to reflect progress)
         self._live_state: dict[str, Any] | None = None
         self._live_state_lock = threading.RLock()
+        # cada cuantos archivos volcar el estado a disco durante una sync
+        self._state_flush_every = 10
 
     def get_state(self) -> dict[str, Any]:
         # If a task is running, prefer the live in-memory state so the web UI
@@ -310,6 +312,7 @@ class AppService:
         failed_files = 0
         uploaded_bytes = 0
 
+        processed_since_flush = 0
         for file_id, file_path, rel_path, size, mtime_ns, source_sha256 in changed_files:
             entry = files_state.setdefault(
                 file_id,
@@ -354,6 +357,12 @@ class AppService:
                 entry["last_error"] = str(exc)
                 failed_files += 1
                 LOGGER.exception("sync error subiendo path=%s", rel_path)
+
+            # cada N archivos, volcar el state actual a disco para no perder progreso
+            processed_since_flush += 1
+            if processed_since_flush >= self._state_flush_every:
+                self.state_manager.save(state)
+                processed_since_flush = 0
 
         self.state_manager.save(state)
         summary = {
@@ -434,6 +443,7 @@ class AppService:
         failed_files = 0
         uploaded_bytes = 0
 
+        processed_since_flush = 0
         for file_id, file_path, rel_path, size, mtime_ns, source_sha256 in new_files:
             entry = files_state.setdefault(
                 file_id,
@@ -478,6 +488,12 @@ class AppService:
                 entry["last_error"] = str(exc)
                 failed_files += 1
                 LOGGER.exception("sync por nombre error subiendo path=%s", rel_path)
+
+            # cada N archivos, volcar el state actual a disco para no perder progreso
+            processed_since_flush += 1
+            if processed_since_flush >= self._state_flush_every:
+                self.state_manager.save(state)
+                processed_since_flush = 0
 
         self.state_manager.save(state)
         summary = {
