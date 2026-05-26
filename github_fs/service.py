@@ -7,6 +7,7 @@ import math
 import random
 import threading
 import time
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,9 +105,21 @@ class AppService:
         self._choose = chooser or random.choice
         self._sleep_sampler = sleep_sampler or random.uniform
         self._sleeper = sleeper or time.sleep
+        # live in-memory state while a task is running (used by web UI to reflect progress)
+        self._live_state: dict[str, Any] | None = None
+        self._live_state_lock = threading.RLock()
 
     def get_state(self) -> dict[str, Any]:
-        state = self.state_manager.snapshot(self.default_config)
+        # If a task is running, prefer the live in-memory state so the web UI
+        # can show progress (new files/versions) before they're persisted.
+        with self._live_state_lock:
+            live = deepcopy(self._live_state) if self._live_state is not None else None
+
+        if live is not None:
+            state = live
+        else:
+            state = self.state_manager.snapshot(self.default_config)
+
         self._refresh_task_running_flags(state)
         self._augment_state_for_web(state)
         return state
@@ -145,15 +158,24 @@ class AppService:
                 self.state_manager.save(state)
                 LOGGER.info("%s iniciado.", task_name)
 
-                result = callback(state)
-                state["tasks"][task_name]["running"] = False
-                state["tasks"][task_name]["last_finished_at"] = utc_now_iso()
-                state["tasks"][task_name]["last_result"] = "success" if result.ok else "error"
-                state["tasks"][task_name]["last_error"] = result.error
-                state["tasks"][task_name]["last_summary"] = result.summary
-                self.state_manager.save(state)
-                LOGGER.info("%s finalizado con resultado=%s resumen=%s", task_name, "success" if result.ok else "error", result.summary)
-                return result
+                # expose the in-memory state for the web UI while the task runs
+                with self._live_state_lock:
+                    self._live_state = state
+
+                try:
+                    result = callback(state)
+
+                    state["tasks"][task_name]["running"] = False
+                    state["tasks"][task_name]["last_finished_at"] = utc_now_iso()
+                    state["tasks"][task_name]["last_result"] = "success" if result.ok else "error"
+                    state["tasks"][task_name]["last_error"] = result.error
+                    state["tasks"][task_name]["last_summary"] = result.summary
+                    self.state_manager.save(state)
+                    LOGGER.info("%s finalizado con resultado=%s resumen=%s", task_name, "success" if result.ok else "error", result.summary)
+                    return result
+                finally:
+                    with self._live_state_lock:
+                        self._live_state = None
         except Exception as exc:
             state = self.state_manager.load(self.default_config)
             state["tasks"][task_name]["running"] = False
