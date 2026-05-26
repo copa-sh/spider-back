@@ -65,7 +65,9 @@ Si `APP_WEB_PIN` o `APP_ENCRYPTION_KEY` no están definidos, se generan automát
 En `/state/index.json` se guardan:
 
 - tareas de sync y verify
-- `sync_by_name` es la sync automatica periodica; `sync` queda como accion manual completa
+- `sync_by_name` es la sync automatica periodica
+- `sync` confia en el estado persistido para los archivos ya catalogados
+- `full sync` fuerza una validacion completa del contenido y crea nueva version si detecta cambios reales
 - catálogo de archivos y versiones
 - bloque `github_accounts` con:
   - owner por cuenta
@@ -138,6 +140,7 @@ Comandos auxiliares:
 ```bash
 python3 -m github_fs.main scheduler
 python3 -m github_fs.main run-once-sync
+python3 -m github_fs.main run-once-full-sync
 python3 -m github_fs.main run-once-sync-by-name
 python3 -m github_fs.main run-once-verify
 ```

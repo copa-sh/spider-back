@@ -78,6 +78,9 @@ HOME_TEMPLATE = """
     <form method="post" action="{{ url_for('trigger_sync') }}">
       <button type="submit">Lanzar sync</button>
     </form>
+    <form method="post" action="{{ url_for('trigger_full_sync') }}">
+      <button type="submit">Lanzar sync completa</button>
+    </form>
     <form method="post" action="{{ url_for('trigger_sync_by_name') }}">
       <button type="submit">Lanzar sync por nombre</button>
     </form>
@@ -194,6 +197,7 @@ def create_web_app(service: AppService) -> Flask:
     def run_background(method_name: str) -> None:
         task_name_map = {
             "run_sync": "sync",
+            "run_full_sync": "sync",
             "run_sync_by_name": "sync_by_name",
             "run_verify": "verify",
         }
@@ -276,6 +280,12 @@ def create_web_app(service: AppService) -> Flask:
     @require_login
     def trigger_sync():
         run_background("run_sync")
+        return redirect(url_for("home"))
+
+    @app.post("/actions/full-sync")
+    @require_login
+    def trigger_full_sync():
+        run_background("run_full_sync")
         return redirect(url_for("home"))
 
     @app.post("/actions/sync-by-name")

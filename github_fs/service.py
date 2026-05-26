@@ -112,7 +112,10 @@ class AppService:
         return state
 
     def run_sync(self) -> TaskResult:
-        return self._run_task("sync", self._sync_impl)
+        return self._run_task("sync", lambda state: self._sync_impl(state, full=False))
+
+    def run_full_sync(self) -> TaskResult:
+        return self._run_task("sync", lambda state: self._sync_impl(state, full=True))
 
     def run_sync_by_name(self) -> TaskResult:
         return self._run_task("sync_by_name", self._sync_by_name_impl)
@@ -198,12 +201,12 @@ class AppService:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             return False
 
-    def _sync_impl(self, state: dict[str, Any]) -> TaskResult:
+    def _sync_impl(self, state: dict[str, Any], *, full: bool) -> TaskResult:
         if not self.config.app_data_dir.exists():
             raise ServiceError(f"No existe el directorio de datos: {self.config.app_data_dir}")
 
         self._ensure_github_accounts_state(state)
-        LOGGER.info("sync escaneando directorio=%s", self.config.app_data_dir)
+        LOGGER.info("sync escaneando directorio=%s modo=%s", self.config.app_data_dir, "full" if full else "light")
         files_state = state["files"]
         discovered_paths: set[str] = set()
         changed_files: list[tuple[str, Path, str, int, int, str]] = []
@@ -219,10 +222,27 @@ class AppService:
             stat = file_path.stat()
             size = stat.st_size
             mtime_ns = stat.st_mtime_ns
-            source_sha256 = sha256_file(file_path)
 
             entry = files_state.get(file_id)
             active_version = self._get_active_version(entry) if entry else None
+            if not full and self._can_trust_persisted_file_state(entry, active_version):
+                entry["size"] = size
+                entry["mtime_ns"] = mtime_ns
+                entry["present"] = True
+                entry["last_seen_at"] = utc_now_iso()
+                unchanged_files += 1
+                if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
+                    LOGGER.info(
+                        "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
+                        scanned_files,
+                        len(changed_files),
+                        unchanged_files,
+                        rel_path,
+                    )
+                    last_scan_log_at = time.monotonic()
+                continue
+
+            source_sha256 = sha256_file(file_path)
             if active_version and active_version.get("plaintext_sha256") == source_sha256 and entry.get("present"):
                 entry["size"] = size
                 entry["mtime_ns"] = mtime_ns
@@ -520,6 +540,22 @@ class AppService:
             },
             None if failures == 0 else f"{failures} archivos con error",
         )
+
+    @staticmethod
+    def _can_trust_persisted_file_state(
+        entry: dict[str, Any] | None,
+        active_version: dict[str, Any] | None,
+    ) -> bool:
+        if not entry or not active_version:
+            return False
+        if not entry.get("present"):
+            return False
+        source_sha256 = entry.get("source_sha256")
+        if not source_sha256:
+            return False
+        if active_version.get("plaintext_sha256") != source_sha256:
+            return False
+        return True
 
     def _upload_file_version(
         self,

@@ -74,6 +74,10 @@ def make_service(tmp_path: Path, *, daily_limit_gb: float = 1, repo_limit_kb: in
     state_dir = tmp_path / "state"
     data_dir.mkdir()
     state_dir.mkdir()
+    return make_service_for_dirs(data_dir, state_dir, daily_limit_gb=daily_limit_gb, repo_limit_kb=repo_limit_kb)
+
+
+def make_service_for_dirs(data_dir: Path, state_dir: Path, *, daily_limit_gb: float = 1, repo_limit_kb: int = 2048):
     config = AppConfig(
         github_accounts=(
             GitHubAccountConfig("account_1", "owner-a", "token-a"),
@@ -178,6 +182,62 @@ def test_sync_by_name_skips_known_files_without_hashing_them(tmp_path, monkeypat
     assert len(state["files"]) == 2
     new_entry = state["files"][next(file_id for file_id, entry in state["files"].items() if entry["path"] == "archivo2.jpg")]
     assert new_entry["versions"][0]["repository"] == "github-fs-0001"
+
+
+def test_sync_reuses_persisted_file_state_after_restart(tmp_path, monkeypatch):
+    service, data_dir, _ = make_service(tmp_path)
+    sample = data_dir / "archivo.txt"
+    sample.write_text("contenido estable", encoding="utf-8")
+
+    first_sync = service.run_sync()
+    assert first_sync.ok is True
+
+    restarted_service, _, _ = make_service_for_dirs(data_dir, service.config.app_state_dir)
+    restarted_service.github_clients = service.github_clients
+
+    def fail_if_hashed(path, chunk_size: int = 1024 * 1024):
+        raise AssertionError(f"sha256_file no deberia ejecutarse para {path}")
+
+    monkeypatch.setattr("github_fs.service.sha256_file", fail_if_hashed)
+
+    sync = restarted_service.run_sync()
+    assert sync.ok is True
+    assert sync.summary["scanned_files"] == 1
+    assert sync.summary["uploaded_files"] == 0
+    assert sync.summary["failed_files"] == 0
+
+
+def test_sync_trusts_persisted_version_until_full_sync(tmp_path):
+    service, data_dir, _ = make_service(tmp_path)
+    sample = data_dir / "archivo.txt"
+    sample.write_text("version inicial", encoding="utf-8")
+
+    first_sync = service.run_sync()
+    assert first_sync.ok is True
+
+    original_state = service.get_state()
+    file_id, entry = next(iter(original_state["files"].items()))
+    original_version_id = entry["active_version_id"]
+    original_sha = entry["source_sha256"]
+
+    sample.write_text("version modificada", encoding="utf-8")
+
+    light_sync = service.run_sync()
+    assert light_sync.ok is True
+    assert light_sync.summary["uploaded_files"] == 0
+
+    light_state = service.get_state()
+    assert light_state["files"][file_id]["active_version_id"] == original_version_id
+    assert light_state["files"][file_id]["source_sha256"] == original_sha
+
+    full_sync = service.run_full_sync()
+    assert full_sync.ok is True
+    assert full_sync.summary["uploaded_files"] == 1
+
+    full_state = service.get_state()
+    assert full_state["files"][file_id]["active_version_id"] != original_version_id
+    assert full_state["files"][file_id]["source_sha256"] != original_sha
+    assert len(full_state["files"][file_id]["versions"]) == 2
 
 
 def test_creates_new_repository_when_existing_one_is_full(tmp_path):
@@ -291,6 +351,9 @@ def test_web_login_and_manual_actions(tmp_path):
 
     trigger = client.post("/actions/verify")
     assert trigger.status_code == 302
+
+    full_sync_trigger = client.post("/actions/full-sync")
+    assert full_sync_trigger.status_code == 302
 
 
 def test_home_shows_github_account_alerts_table(tmp_path):
