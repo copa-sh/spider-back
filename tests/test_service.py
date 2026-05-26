@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 
 from github_fs.config import AppConfig, GitHubAccountConfig, RuntimeSecrets
+from github_fs.github_api import GitHubError
 from github_fs.service import AppService
 from github_fs.state import StateManager
 from github_fs.web import create_web_app
@@ -26,6 +27,7 @@ class FakeGitHubClient:
         self.commits: list[tuple[str, str]] = []
         self.created_repositories: list[str] = []
         self.initialized_branches: set[tuple[str, str]] = set()
+        self.create_repository_error: Exception | None = None
 
     def list_managed_repositories(self, owner: str, prefix: str):
         return sorted([repo for repo in self.repositories.values() if repo.name.startswith(prefix)], key=lambda item: item.name)
@@ -34,6 +36,8 @@ class FakeGitHubClient:
         return self.repositories[repo]
 
     def create_repository(self, owner: str, name: str, private: bool):
+        if self.create_repository_error:
+            raise self.create_repository_error
         info = FakeRepositoryInfo(owner, name, size_kb=0, private=private)
         self.repositories[name] = info
         self.created_repositories.append(name)
@@ -213,6 +217,29 @@ def test_uses_second_account_when_first_reaches_daily_limit(tmp_path):
     assert version["account_id"] == "account_2"
 
 
+def test_reports_actionable_error_when_token_cannot_create_repository(tmp_path):
+    service, data_dir, _ = make_service(tmp_path, repo_limit_kb=1)
+    client = service.github_clients["account_1"]
+    second_client = service.github_clients["account_2"]
+    client.repositories["github-fs-0001"] = FakeRepositoryInfo("owner-a", "github-fs-0001", size_kb=1)
+    client.create_repository_error = GitHubError(
+        'HTTP 403: {"message":"Resource not accessible by personal access token","status":"403"}'
+    )
+    (data_dir / "archivo.txt").write_text("hola", encoding="utf-8")
+
+    sync = service.run_sync()
+
+    assert sync.ok is True
+    state = service.get_state()
+    version = next(iter(state["files"].values()))["versions"][0]
+    assert version["account_id"] == "account_2"
+    assert second_client.created_repositories == ["github-fs-0001"]
+    account_1_state = state["github_accounts"]["account_1"]
+    assert account_1_state["available"] is False
+    assert "no puede crear repositorios" in account_1_state["unavailable_reason"]
+    assert account_1_state["alerts"][0]["code"] == "repository_creation_forbidden"
+
+
 def test_fails_when_all_accounts_are_over_daily_limit(tmp_path):
     service, data_dir, _ = make_service(tmp_path, daily_limit_gb=0.01)
     state = service.state_manager.load(service.default_config)
@@ -264,6 +291,28 @@ def test_web_login_and_manual_actions(tmp_path):
 
     trigger = client.post("/actions/verify")
     assert trigger.status_code == 302
+
+
+def test_home_shows_github_account_alerts_table(tmp_path):
+    service, data_dir, _ = make_service(tmp_path, repo_limit_kb=1)
+    blocked_client = service.github_clients["account_1"]
+    blocked_client.repositories["github-fs-0001"] = FakeRepositoryInfo("owner-a", "github-fs-0001", size_kb=1)
+    blocked_client.create_repository_error = GitHubError(
+        'HTTP 403: {"message":"Resource not accessible by personal access token","status":"403"}'
+    )
+    (data_dir / "archivo.txt").write_text("hola", encoding="utf-8")
+    sync = service.run_sync()
+    assert sync.ok is True
+
+    app = create_web_app(service)
+    client = app.test_client()
+    client.post("/login", data={"pin": "12345678"})
+
+    response = client.get("/")
+    assert response.status_code == 200
+    assert b"Alertas" in response.data
+    assert b"owner-a (account_1)" in response.data
+    assert b"no puede crear repositorios" in response.data
 
 
 def test_web_logs_view_reads_persisted_log_file(tmp_path):

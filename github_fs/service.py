@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from .config import AppConfig, GitHubAccountConfig, RuntimeSecrets
 from .crypto import StreamingAESGCMDecryptor, chunk_bytes, encrypt_bytes
-from .github_api import GitHubClient, GitHubSettings, RepositoryInfo
+from .github_api import GitHubClient, GitHubError, GitHubSettings, RepositoryInfo
 from .state import StateManager
 from .utils import (
     iter_files,
@@ -100,6 +100,7 @@ class AppService:
             "sync_by_name": self.config.app_state_dir / "sync_by_name.lock",
             "verify": self.config.app_state_dir / "verify.lock",
         }
+        self._runtime_unavailable_accounts: set[str] = set()
         self._choose = chooser or random.choice
         self._sleep_sampler = sleep_sampler or random.uniform
         self._sleeper = sleeper or time.sleep
@@ -648,6 +649,8 @@ class AppService:
 
         for account in self.config.github_accounts:
             account_state = self._account_state(state, account.account_id, owner=account.owner)
+            if account.account_id in self._runtime_unavailable_accounts:
+                continue
             used_today = int(account_state["daily_uploads"].get(today, 0))
             if used_today + estimated_upload_bytes > self.config.github_account_daily_upload_limit_bytes:
                 continue
@@ -656,7 +659,35 @@ class AppService:
         if not eligible_accounts:
             raise ServiceError("Ninguna cuenta GitHub tiene cuota diaria disponible para esta subida.")
 
-        account = self._choose(eligible_accounts)
+        remaining_accounts = list(eligible_accounts)
+        last_error: ServiceError | None = None
+        while remaining_accounts:
+            account = self._choose(remaining_accounts)
+            remaining_accounts.remove(account)
+            try:
+                return self._allocate_upload_target_for_account(state, account, estimated_upload_kb)
+            except ServiceError as exc:
+                last_error = exc
+                if account.account_id in self._runtime_unavailable_accounts:
+                    LOGGER.warning(
+                        "sync cuenta no disponible, probando otra cuenta cuenta=%s owner=%s motivo=%s",
+                        account.account_id,
+                        account.owner,
+                        exc,
+                    )
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+        raise ServiceError("No se pudo seleccionar una cuenta GitHub para esta subida.")
+
+    def _allocate_upload_target_for_account(
+        self,
+        state: dict[str, Any],
+        account: GitHubAccountConfig,
+        estimated_upload_kb: int,
+    ) -> UploadTarget:
         account_state = self._account_state(state, account.account_id, owner=account.owner)
 
         if account.pinned_repository:
@@ -732,7 +763,25 @@ class AppService:
             next_index += 1
         client = self._client_for_account(account.account_id)
         LOGGER.info("sync creando repositorio nuevo cuenta=%s owner=%s repo=%s", account.account_id, account.owner, candidate)
-        info = client.create_repository(account.owner, candidate, self.config.github_repository_private)
+        try:
+            info = client.create_repository(account.owner, candidate, self.config.github_repository_private)
+        except GitHubError as exc:
+            message = str(exc)
+            if "HTTP 403" in message and "Resource not accessible by personal access token" in message:
+                alert_message = (
+                    f"El token GitHub de la cuenta {account.account_id} no puede crear repositorios en {account.owner}. "
+                    "Usa un token con permiso para administrarlos o configura un repositorio fijo existente."
+                )
+                self._mark_account_unavailable(
+                    state,
+                    account,
+                    code="repository_creation_forbidden",
+                    message=alert_message,
+                )
+                raise ServiceError(alert_message) from exc
+            raise ServiceError(
+                f"No se pudo crear el repositorio {account.owner}/{candidate} para la cuenta {account.account_id}: {message}"
+            ) from exc
         repo_state = account_state["repositories"].setdefault(candidate, {})
         repo_state["name"] = candidate
         repo_state["owner"] = account.owner
@@ -740,6 +789,34 @@ class AppService:
         repo_state["private"] = info.private
         repo_state["last_refreshed_at"] = utc_now_iso()
         return info
+
+    def _mark_account_unavailable(
+        self,
+        state: dict[str, Any],
+        account: GitHubAccountConfig,
+        *,
+        code: str,
+        message: str,
+    ) -> None:
+        account_state = self._account_state(state, account.account_id, owner=account.owner)
+        detected_at = utc_now_iso()
+        alerts = account_state.setdefault("alerts", [])
+        existing = next((item for item in alerts if item.get("code") == code), None)
+        payload = {
+            "code": code,
+            "message": message,
+            "detected_at": detected_at,
+            "level": "error",
+            "needs_user_action": True,
+        }
+        if existing:
+            existing.update(payload)
+        else:
+            alerts.append(payload)
+        account_state["available"] = False
+        account_state["unavailable_reason"] = message
+        account_state["unavailable_since"] = detected_at
+        self._runtime_unavailable_accounts.add(account.account_id)
 
     def _record_uploaded_bytes(self, state: dict[str, Any], account_id: str, uploaded_bytes: int) -> None:
         account_state = self._account_state(state, account_id)
@@ -792,6 +869,10 @@ class AppService:
                     "daily_uploads": {},
                     "last_metadata_refresh_at": None,
                     "last_upload_at": None,
+                    "available": True,
+                    "unavailable_reason": None,
+                    "unavailable_since": None,
+                    "alerts": [],
                 },
             )
 
@@ -806,12 +887,20 @@ class AppService:
                 "daily_uploads": {},
                 "last_metadata_refresh_at": None,
                 "last_upload_at": None,
+                "available": True,
+                "unavailable_reason": None,
+                "unavailable_since": None,
+                "alerts": [],
             },
         )
         if owner:
             payload["owner"] = owner
         payload.setdefault("repositories", {})
         payload.setdefault("daily_uploads", {})
+        payload.setdefault("available", True)
+        payload.setdefault("unavailable_reason", None)
+        payload.setdefault("unavailable_since", None)
+        payload.setdefault("alerts", [])
         return payload
 
     def _augment_state_for_web(self, state: dict[str, Any]) -> None:
@@ -828,9 +917,25 @@ class AppService:
                     "uploaded_today_bytes": int(account_state["daily_uploads"].get(today, 0)),
                     "daily_limit_bytes": self.config.github_account_daily_upload_limit_bytes,
                     "repositories": repositories,
+                    "available": bool(account_state.get("available", True)) and account.account_id not in self._runtime_unavailable_accounts,
+                    "unavailable_reason": account_state.get("unavailable_reason"),
+                    "unavailable_since": account_state.get("unavailable_since"),
+                    "alerts": list(account_state.get("alerts", [])),
                 }
             )
         state["github_account_summaries"] = summaries
+        state["github_account_alerts"] = [
+            {
+                "account_id": summary["account_id"],
+                "owner": summary["owner"],
+                "available": summary["available"],
+                "unavailable_reason": summary["unavailable_reason"],
+                "unavailable_since": summary["unavailable_since"],
+                "alerts": summary["alerts"],
+            }
+            for summary in summaries
+            if summary["alerts"] or not summary["available"]
+        ]
 
     @staticmethod
     def _today_bucket() -> str:

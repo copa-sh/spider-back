@@ -34,11 +34,47 @@ HOME_TEMPLATE = """
       {% for account in state.github_account_summaries %}
       <li>
         {{ account.account_id }} ({{ account.owner }}) |
+        disponible={{ "si" if account.available else "no" }} |
         hoy={{ account.uploaded_today_bytes }}/{{ account.daily_limit_bytes }} bytes |
         repos={{ account.repositories|length }}
       </li>
       {% endfor %}
     </ul>
+    <h2>Alertas</h2>
+    {% if state.github_account_alerts %}
+    <table border="1" cellpadding="6" cellspacing="0">
+      <thead>
+        <tr>
+          <th>github_user</th>
+          <th>Disponible</th>
+          <th>Problema</th>
+          <th>Detectado</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for account in state.github_account_alerts %}
+          {% for alert in account.alerts %}
+          <tr>
+            <td>{{ account.owner }} ({{ account.account_id }})</td>
+            <td>{{ "si" if account.available else "no" }}</td>
+            <td>{{ alert.message }}</td>
+            <td>{{ alert.detected_at }}</td>
+          </tr>
+          {% endfor %}
+          {% if not account.alerts and account.unavailable_reason %}
+          <tr>
+            <td>{{ account.owner }} ({{ account.account_id }})</td>
+            <td>{{ "si" if account.available else "no" }}</td>
+            <td>{{ account.unavailable_reason }}</td>
+            <td>{{ account.unavailable_since or "-" }}</td>
+          </tr>
+          {% endif %}
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p>Sin alertas.</p>
+    {% endif %}
     <form method="post" action="{{ url_for('trigger_sync') }}">
       <button type="submit">Lanzar sync</button>
     </form>
