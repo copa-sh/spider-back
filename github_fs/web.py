@@ -76,16 +76,16 @@ HOME_TEMPLATE = """
     <p>Sin alertas.</p>
     {% endif %}
     <form method="post" action="{{ url_for('trigger_sync') }}">
-      <button type="submit">Lanzar sync</button>
+      <button type="submit">Sincronización Rápida (Optimizada)</button>
     </form>
     <form method="post" action="{{ url_for('trigger_full_sync') }}">
-      <button type="submit">Lanzar sync completa</button>
+      <button type="submit">Verificar y Sincronizar Todo</button>
     </form>
     <form method="post" action="{{ url_for('trigger_sync_by_name') }}">
-      <button type="submit">Lanzar sync por nombre</button>
+      <button type="submit">Subir Solo Archivos Nuevos</button>
     </form>
     <form method="post" action="{{ url_for('trigger_verify') }}">
-      <button type="submit">Lanzar verificacion</button>
+      <button type="submit">Lanzar verificacion de integridad</button>
     </form>
     <p><a href="{{ url_for('files') }}">Ver archivos</a></p>
     <p><a href="{{ url_for('logs') }}">Ver logs</a></p>
