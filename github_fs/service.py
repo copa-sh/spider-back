@@ -340,6 +340,9 @@ class AppService:
                 entry["last_seen_at"] = utc_now_iso()
                 entry.setdefault("versions", []).append(version)
                 entry["active_version_id"] = version["version_id"]
+                # New version supersedes any prior verification — the stored
+                # last_verification was for the previous active version.
+                entry["last_verification"] = None
                 entry["last_error"] = None
                 uploaded_files += 1
                 uploaded_bytes += version["uploaded_bytes"]
@@ -415,10 +418,10 @@ class AppService:
 
             entry = files_state.get(file_id)
             active_version = self._get_active_version(entry) if entry else None
-            if active_version and entry.get("present"):
-                entry["size"] = size
-                entry["mtime_ns"] = mtime_ns
-                entry["present"] = True
+            stored_size = entry.get("size") if entry else None
+            stored_mtime_ns = entry.get("mtime_ns") if entry else None
+            unchanged = stored_size == size and stored_mtime_ns == mtime_ns
+            if active_version and entry.get("present") and unchanged:
                 entry["last_seen_at"] = utc_now_iso()
                 skipped_files += 1
                 if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
@@ -484,6 +487,9 @@ class AppService:
                 entry["last_seen_at"] = utc_now_iso()
                 entry.setdefault("versions", []).append(version)
                 entry["active_version_id"] = version["version_id"]
+                # New version supersedes any prior verification — the stored
+                # last_verification was for the previous active version.
+                entry["last_verification"] = None
                 entry["last_error"] = None
                 uploaded_files += 1
                 uploaded_bytes += version["uploaded_bytes"]

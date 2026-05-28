@@ -141,7 +141,7 @@ FILE_TEMPLATE = """
     <h1>{{ file.path }}</h1>
     <p><a href="{{ url_for('files') }}">Volver</a></p>
     <p><strong>Presente:</strong> {{ file.present }}</p>
-    <p><strong>SHA local:</strong> {{ file.source_sha256 }}</p>
+    <p><strong>SHA al subir:</strong> {{ file.source_sha256 }}</p>
     <p><strong>Ultima verificacion:</strong> {{ file.last_verification.checked_at if file.last_verification else "nunca" }}</p>
     <p><strong>Version activa:</strong> {{ file.active_version_id or "ninguna" }}</p>
     <p><strong>Error:</strong> {{ file.last_error or "ninguno" }}</p>
@@ -234,7 +234,12 @@ def create_web_app(service: AppService) -> Flask:
         stats = {
           "present": sum(1 for item in files if item.get("present")),
           "uploaded": sum(1 for item in files if item.get("active_version_id")),
-          "verified": sum(1 for item in files if item.get("last_verification", {}).get("ok") is True),
+          "verified": sum(
+              1
+              for item in files
+              if (item.get("last_verification") or {}).get("ok") is True
+              and (item.get("last_verification") or {}).get("version_id") == item.get("active_version_id")
+          ),
           "absent": sum(1 for item in files if not item.get("present")),
           "with_error": sum(1 for item in files if item.get("last_error")),
           "total_versions": sum(len(item.get("versions", [])) for item in files),
