@@ -35,6 +35,10 @@ class ServiceError(Exception):
     pass
 
 
+class NoAvailableAccountsError(ServiceError):
+    """Raised when no GitHub accounts have daily upload quota available."""
+
+
 @dataclass
 class TaskResult:
     ok: bool
@@ -347,6 +351,19 @@ class AppService:
                     version["version_id"],
                     version["uploaded_bytes"],
                 )
+            except NoAvailableAccountsError as exc:
+                # No GitHub accounts have available daily quota: stop the sync task.
+                entry["last_error"] = str(exc)
+                self.state_manager.save(state)
+                summary = {
+                    "scanned_files": len(discovered_paths),
+                    "uploaded_files": uploaded_files,
+                    "failed_files": failed_files,
+                    "uploaded_bytes": uploaded_bytes,
+                    "missing_files": sum(1 for entry in files_state.values() if not entry.get("present")),
+                }
+                LOGGER.warning("sync detenido: %s", exc)
+                return TaskResult(False, summary, str(exc))
             except Exception as exc:
                 entry["path"] = rel_path
                 entry["present"] = True
@@ -478,6 +495,20 @@ class AppService:
                     version["version_id"],
                     version["uploaded_bytes"],
                 )
+            except NoAvailableAccountsError as exc:
+                entry["last_error"] = str(exc)
+                self.state_manager.save(state)
+                summary = {
+                    "mode": "name-based",
+                    "scanned_files": len(discovered_paths),
+                    "skipped_files": skipped_files,
+                    "uploaded_files": uploaded_files,
+                    "failed_files": failed_files,
+                    "uploaded_bytes": uploaded_bytes,
+                    "missing_files": sum(1 for entry in files_state.values() if not entry.get("present")),
+                }
+                LOGGER.warning("sync por nombre detenido: %s", exc)
+                return TaskResult(False, summary, str(exc))
             except Exception as exc:
                 entry["path"] = rel_path
                 entry["present"] = True
@@ -738,7 +769,7 @@ class AppService:
             eligible_accounts.append(account)
 
         if not eligible_accounts:
-            raise ServiceError("Ninguna cuenta GitHub tiene cuota diaria disponible para esta subida.")
+            raise NoAvailableAccountsError("Ninguna cuenta GitHub tiene cuota diaria disponible para esta subida.")
 
         remaining_accounts = list(eligible_accounts)
         last_error: ServiceError | None = None
