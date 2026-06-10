@@ -1,309 +1,150 @@
 # Spider-back
 
-## github-fs
+**Spider-back** es un daemon de respaldo distribuido, cifrado y resiliente que almacena tus datos de forma segura repartiendo fragmentos cifrados entre **GitHub** y/o **Telegram**.
 
-Daemon que lee `/datos` en solo lectura, aplica una segunda capa de cifrado a cada archivo, los reparte entre varias cuentas GitHub y verifica periódicamente la integridad reconstruyendo desde GitHub la ultima version activa de cada archivo presente en disco.
+Funciona como una segunda capa de cifrado y fragmentación sobre el contenido de `/datos` (ideal para usar debajo de `gocryptfs`). Trata los archivos locales como bytes opacos, los cifra con AES-256-GCM, los divide en chunks y los distribuye inteligentemente entre los backends configurados.
 
-Si montas `gocryptfs`, `/datos` debe apuntar al directorio ya cifrado que expone `gocryptfs` por debajo. La app no descifra ese contenido local: lo vuelve a cifrar para GitHub y, en verificacion, descifra lo que guardo en GitHub para compararlo con los bytes locales cifrados.
+## Características
 
-## Qué hace
+- **Backends soportados**: GitHub (múltiples cuentas/repos) y Telegram (múltiples canales privados) — simultáneamente si se desea.
+- Cifrado doble: `gocryptfs` (opcional) + AES-256-GCM propio.
+- Fragmentación en chunks configurables.
+- Detección de cambios por hash + sincronización ligera por nombre (rápida).
+- Verificación periódica de integridad reconstruyendo desde los backends remotos.
+- Gestión automática de cuotas diarias y creación de repositorios.
+- Interfaz web mínima con autenticación por PIN.
+- Scheduler integrado para sync y verify automáticos.
+- Estado persistente en `/state/index.json`.
+- Docker-first.
 
-- Detecta archivos nuevos o modificados por hash.
-- Tiene una sincronizacion ligera por nombre para asumir que los archivos ya conocidos no cambiaron y evitar re-hashearlos.
-- Trata el contenido local como bytes opacos, por ejemplo el backend cifrado de `gocryptfs`.
-- Cifra cada archivo con AES-256-GCM y lo divide en chunks.
-- Elige aleatoriamente una cuenta GitHub con cuota diaria disponible.
-- Elige aleatoriamente un repositorio gestionado por la app con capacidad disponible o crea uno nuevo automáticamente.
-- Guarda en `/state/index.json` en qué cuenta y repo quedó cada versión.
-- Verifica integridad de la ultima version activa descargando los chunks cifrados con el token correcto de su cuenta de origen y comparando el resultado con el fichero local cifrado.
-- Expone una web mínima con PIN para ver tareas, archivos, cuentas y repos gestionados.
+## Cómo funciona
 
-## Variables de entorno
+1. Lee archivos en `/datos` (solo lectura).
+2. Cifra cada archivo con AES-256-GCM usando `APP_ENCRYPTION_KEY`.
+3. Divide en chunks.
+4. Elige aleatoriamente un backend (GitHub o Telegram) con cuota disponible.
+5. Sube los chunks y guarda la ubicación en el índice.
+6. Periódicamente verifica la integridad descargando y comparando.
 
-La aplicación ya no usa `GITHUB_REPOSITORY` como configuración principal. Se definen cuentas numeradas:
+## Variables de entorno principales
 
-```env
-GITHUB_ACCOUNT_1_TOKEN=ghp_xxx
-GITHUB_ACCOUNT_1_OWNER=mi-usuario
-GITHUB_ACCOUNT_2_TOKEN=ghp_yyy
-GITHUB_ACCOUNT_2_OWNER=mi-org-o-usuario
-```
-
-Variables globales relevantes:
-
-- `GITHUB_BRANCH=main`
-- `GITHUB_UPLOADS_PREFIX=storage`
-- `GITHUB_REPOSITORY_PREFIX=github-fs`
-- `GITHUB_REPOSITORY_PRIVATE=true`
-- `GITHUB_REPOSITORY_MAX_SIZE_KB=524288`
-- `GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB=5`
-- `GITHUB_CHUNK_SIZE_MB=24`
-- `GITHUB_TIMEOUT_SECONDS=300`
-- `GITHUB_MAX_RETRY=3`
-- `GITHUB_BACKOFF_SECONDS=2`
-- `GITHUB_UPLOAD_SLEEP_MIN_SECONDS=0.25`
-- `GITHUB_UPLOAD_SLEEP_MAX_SECONDS=1.5`
-- `APP_DATA_DIR=/datos`
-- `APP_STATE_DIR=/state`
-- `APP_WEB_HOST=0.0.0.0`
-- `APP_WEB_PORT=8080`
-- `APP_SYNC_INTERVAL_SECONDS=604800` - ejecuta la sync programada ligera por nombre (`sync_by_name`)
-- `APP_VERIFY_INTERVAL_SECONDS=604800`
-- `APP_WEB_PIN`
-- `APP_ENCRYPTION_KEY`
-
-Si `APP_WEB_PIN` o `APP_ENCRYPTION_KEY` no están definidos, se generan automáticamente y se guardan en `/state/secrets.json`.
-
-## Política de almacenamiento remoto
-
-- Los repositorios se crean automáticamente con el patrón `prefijo-0001`, `prefijo-0002`, etc.
-- Antes de usar un repo, la app consulta `GET /repos/{owner}/{repo}` y usa `size` como tamaño actual en KB.
-- Cada cuenta tiene un cupo diario por fecha UTC, medido en bytes realmente subidos.
-- Cada subida remota aplica un sleep aleatorio entre `GITHUB_UPLOAD_SLEEP_MIN_SECONDS` y `GITHUB_UPLOAD_SLEEP_MAX_SECONDS`.
-- Una misma ruta puede tener versiones históricas en cuentas y repos distintos.
-
-## Estado persistente
-
-En `/state/index.json` se guardan:
-
-- tareas de sync y verify
-- `sync_by_name` es la sync automatica periodica
-- `sync` confia en el estado persistido para los archivos ya catalogados
-- `full sync` fuerza una validacion completa del contenido y crea nueva version si detecta cambios reales
-- catálogo de archivos y versiones
-- bloque `github_accounts` con:
-  - owner por cuenta
-  - repos gestionados
-  - último tamaño conocido por repo
-  - buckets diarios de bytes subidos
-- ubicación remota completa por versión:
-  - `account_id`
-  - `repository_owner`
-  - `repository`
-  - `branch`
-  - `manifest_path`
-  - `manifest_raw_url`
-  - `commit_sha`
-  - chunks con `raw_url` y su cuenta asociada
-
-## Docker Compose
-
-1. Crea tu `.env`:
+Copia y edita el archivo correspondiente:
 
 ```bash
 cp .env.example .env
 ```
 
-2. Ajusta tus cuentas GitHub, límites y bind mounts de datos y estado.
-
-3. Arranca:
-
-```bash
-docker compose up -d --build
-```
-
-Esto levanta un solo servicio Docker:
-
-- `app`: web WSGI real con `gunicorn`, y el scheduler de `sync` y `verify` corre dentro del proceso master de Gunicorn
-
-4. Si no definiste PIN, consulta logs:
-
-```bash
-docker compose logs app
-```
-
-## Web
-
-Rutas disponibles:
-
-- `GET /login`
-- `POST /login`
-- `GET /`
-- `GET /files`
-- `GET /files/<file_id>`
-- `GET /logs`
-- `POST /actions/sync`
-- `POST /actions/sync-by-name`
-- `POST /actions/verify`
-
-La home muestra ultimas ejecuciones, resumen de cuotas/repos por cuenta y un enlace a los logs persistidos en `/state/logs/github-fs.log`.
-
-## Desarrollo
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-python3 -m github_fs.main web-dev
-```
-
-Comandos auxiliares:
-
-```bash
-python3 -m github_fs.main scheduler
-python3 -m github_fs.main run-once-sync
-python3 -m github_fs.main run-once-full-sync
-python3 -m github_fs.main run-once-sync-by-name
-python3 -m github_fs.main run-once-verify
-```
-
-Produccion WSGI:
-
-```bash
-gunicorn -c gunicorn.conf.py -w 4 -b 0.0.0.0:8080 github_fs.web:app
-```
-
-Tests:
-
-```bash
-python3 -m pytest
-```
-
-
-
-## telegram-fs
-
-Daemon escrito en Python que lee `/datos` en solo lectura, aplica una segunda capa de cifrado a cada archivo, los reparte entre varios canales privados de Telegram y verifica periódicamente la integridad reconstruyendo desde Telegram la última versión activa de cada archivo presente en disco.
-
-Si montas `gocryptfs`, `/datos` debe apuntar al directorio ya cifrado que expone `gocryptfs` por debajo. La app no descifra ese contenido local: lo vuelve a cifrar para Telegram y, en verificación, descarga y descifra lo que guardó en Telegram para compararlo con los bytes locales cifrados.
-
-## Qué hace
-
-- Detecta archivos nuevos o modificados por hash.
-- Tiene una sincronización ligera por nombre para asumir que los archivos ya conocidos no cambiaron y evitar re-hashearlos.
-- Trata el contenido local como bytes opacos, por ejemplo el backend cifrado de `gocryptfs`.
-- Cifra cada archivo con AES-256-GCM y lo divide en chunks.
-- Utiliza la API de cliente de Telegram (MTProto) a través de un cliente de Python para saltar la limitación de tamaño de la API de bots tradicional.
-- Elige aleatoriamente un canal de Telegram configurado que tenga cuota diaria disponible.
-- Guarda en `/state/index.json` en qué canal y con qué identificador de mensaje (`message_id`) quedó cada versión y chunk.
-- Verifica la integridad de la última versión activa descargando los chunks cifrados desde su canal de origen usando el cliente de Telegram y comparando el resultado con el fichero local cifrado.
-- Expone una web mínima con PIN para ver tareas, archivos, canales y sesiones de Telegram gestionadas.
-
-## Variables de entorno
-
-La aplicación define canales y sesiones de Telegram numeradas para la distribución de la carga:
+### Configuración común
 
 ```env
-# Configuración de la API de Telegram (Obtenida en my.telegram.org)
-TELEGRAM_API_ID=123456
+APP_DATA_DIR=/datos
+APP_STATE_DIR=/state
+APP_WEB_HOST=0.0.0.0
+APP_WEB_PORT=8080
+APP_WEB_PIN=                  # Se genera automáticamente si no existe
+APP_ENCRYPTION_KEY=           # Se genera automáticamente si no existe
+
+APP_SYNC_INTERVAL_SECONDS=604800
+APP_VERIFY_INTERVAL_SECONDS=604800
+```
+
+### Backend GitHub
+
+```env
+# Cuentas (puedes tener tantas como quieras)
+GITHUB_ACCOUNT_1_TOKEN=ghp_xxxxxxxxxxxxxxxx
+GITHUB_ACCOUNT_1_OWNER=tuusuario
+GITHUB_ACCOUNT_2_TOKEN=ghp_yyyyyyyyyyyyyyyyyyyy
+GITHUB_ACCOUNT_2_OWNER=tuorg
+
+GITHUB_BRANCH=main
+GITHUB_REPOSITORY_PREFIX=spider-back
+GITHUB_REPOSITORY_PRIVATE=true
+GITHUB_REPOSITORY_MAX_SIZE_KB=524288
+GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB=5
+GITHUB_CHUNK_SIZE_MB=24
+```
+
+### Backend Telegram
+
+```env
+# Obtenidas en https://my.telegram.org
+TELEGRAM_API_ID=1234567
 TELEGRAM_API_HASH=abcdef0123456789abcdef0123456789
 
-# Canales privados de destino (IDs numéricos de Telegram, habitualmente empiezan por -100)
+# Canales privados (IDs suelen empezar por -100)
 TELEGRAM_CHANNEL_1_ID=-1001234567890
 TELEGRAM_CHANNEL_2_ID=-1000987654321
+
+TELEGRAM_MAX_FILE_SIZE_MB=2000
+TELEGRAM_CHANNEL_DAILY_UPLOAD_LIMIT_GB=50
+TELEGRAM_CHUNK_SIZE_MB=24
 ```
 
-Variables globales relevantes:
-
-- `TELEGRAM_UPLOADS_PREFIX=storage`
-- `TELEGRAM_MAX_FILE_SIZE_MB=2000` - Límite estricto de Telegram por archivo para usuarios gratuitos (2 GB)
-- `TELEGRAM_CHANNEL_DAILY_UPLOAD_LIMIT_GB=50` - Límite diario preventivo para evitar bloqueos por spam
-- `TELEGRAM_CHUNK_SIZE_MB=24`
-- `TELEGRAM_TIMEOUT_SECONDS=600`
-- `TELEGRAM_MAX_RETRY=5`
-- `TELEGRAM_BACKOFF_SECONDS=5`
-- `TELEGRAM_UPLOAD_SLEEP_MIN_SECONDS=1.0` - Sleep más alto para respetar los límites de ratio (*rate limits*) de Telegram
-- `TELEGRAM_UPLOAD_SLEEP_MAX_SECONDS=3.5`
-- `APP_DATA_DIR=/datos`
-- `APP_STATE_DIR=/state`
-- `APP_WEB_HOST=0.0.0.0`
-- `APP_WEB_PORT=8080`
-- `APP_SYNC_INTERVAL_SECONDS=604800` - Ejecuta la sync programada ligera por nombre (`sync_by_name`)
-- `APP_VERIFY_INTERVAL_SECONDS=604800`
-- `APP_WEB_PIN`
-- `APP_ENCRYPTION_KEY`
-
-Si `APP_WEB_PIN` o `APP_ENCRYPTION_KEY` no están definidos, se generan automáticamente y se guardan en `/state/secrets.json`.
-
-## Política de almacenamiento remoto
-
-- Los archivos se suben a los canales privados indicados en las variables de entorno.
-- Cada canal tiene un cupo diario por fecha UTC, medido en bytes realmente subidos a la red de Telegram.
-- Cada subida remota aplica un sleep aleatorio largo entre `TELEGRAM_UPLOAD_SLEEP_MIN_SECONDS` y `TELEGRAM_UPLOAD_SLEEP_MAX_SECONDS` para mitigar el riesgo de recibir un error `FloodWait` de la API.
-- Una misma ruta de archivo local puede tener versiones históricas distribuidas en canales distintos.
-
-## Estado persistente
-
-En `/state/index.json` se guardan:
-
-- Tareas de sync y verify.
-- `sync_by_name`: es la sync automática periódica.
-- `sync`: confía en el estado persistido para los archivos ya catalogados.
-- `full sync`: fuerza una validación completa del contenido y crea una nueva versión si detecta cambios reales.
-- Catálogo de archivos y versiones.
-- Archivos de sesión de Telegram (`.session`) dentro de `/state/` para mantener la sesión activa sin pedir SMS en cada reinicio.
-- Bloque `telegram_channels` con:
-  - ID del canal.
-  - Cantidad de archivos gestionados.
-  - Buckets diarios de bytes subidos.
-- Ubicación remota completa por versión:
-  - `channel_id`
-  - `message_id` (ID único del mensaje contenedor en el canal)
-  - `file_id` (Identificador interno del archivo en los servidores de Telegram)
-  - Chunks con su correspondiente `message_id` y canal asociado.
-
-## Docker Compose
-
-1. Crea tu `.env`:
+## Docker
 
 ```bash
-cp .env.example .env
-```
-
-2. Ajusta tus credenciales de la API de Telegram, IDs de canales privados, límites y bind mounts de datos y estado.
-
-3. Arranca en modo interactivo **la primera vez** para introducir el código de verificación SMS de Telegram:
-
-```bash
-docker compose run --rm app python3 -m telegram_fs.main login
-```
-
-4. Una vez creados los archivos de sesión `.session` en tu directorio `/state`, arranca el daemon de forma normal:
-
-```bash
+# Construir e iniciar
 docker compose up -d --build
+
+# Primera vez con Telegram (login)
+docker compose run --rm app python3 -m spider_back.main telegram-login
 ```
 
-Esto levanta un solo servicio Docker:
-
-- `app`: web WSGI real con `gunicorn`, y el scheduler de `sync` y `verify` corre dentro del proceso master de Gunicorn.
-
-5. Si no definiste PIN para la web, consulta los logs:
+Si no definiste `APP_WEB_PIN`, revisa los logs:
 
 ```bash
-docker compose logs app
+docker compose logs -f app
 ```
 
-## Web
+## Interfaz Web
 
-Rutas disponibles:
+Accede a `http://tu-servidor:8080`
 
-- `GET /login`
-- `POST /login`
-- `GET /`
-- `GET /files`
-- `GET /files/<file_id>`
-- `GET /logs`
-- `POST /actions/sync`
-- `POST /actions/sync-by-name`
-- `POST /actions/verify`
+- `GET /login` + `POST /login`
+- `/` → Dashboard (últimas ejecuciones, cuotas, estado)
+- `/files` → Listado de archivos y versiones
+- `/logs` → Logs persistentes
+- Acciones manuales: Sync, Sync-by-name, Full Sync, Verify
 
-La home muestra últimas ejecuciones, resumen de cuotas por canal de Telegram y un enlace a los logs persistidos en `/state/logs/telegram-fs.log`.
-
-## Desarrollo
+## Comandos (desarrollo y mantenimiento)
 
 ```bash
+# Entorno de desarrollo
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-python3 -m telegram_fs.main web-dev
+
+# Modo desarrollo (recarga automática)
+python3 -m spider_back.main web-dev
+
+# Comandos útiles
+python3 -m spider_back.main scheduler
+python3 -m spider_back.main run-once-sync
+python3 -m spider_back.main run-once-full-sync
+python3 -m spider_back.main run-once-sync-by-name
+python3 -m spider_back.main run-once-verify
 ```
 
-Comandos auxiliares:
+## Estructura de almacenamiento
 
-```bash
-python3 -m telegram_fs.main scheduler
-python3 -m telegram_fs.main run-once-sync
-python3 -m telegram_fs.main run-once-full-sync
-```
+- **GitHub**: Repositorios automáticos (`spider-back-0001`, `spider-back-0002`, …) con chunks en el branch configurado.
+- **Telegram**: Mensajes en canales privados con `message_id` y `file_id`.
 
+Todo el historial de versiones se guarda en `/state/index.json`.
+
+## Seguridad
+
+- La aplicación nunca descifra el contenido local (solo compara bytes cifrados).
+- Clave de cifrado generada automáticamente y guardada en `/state/secrets.json`.
+- Tokens y sesiones de Telegram se guardan en el volumen persistente `/state`.
+
+## Recomendaciones
+
+- Usa `gocryptfs` en `/datos` para cifrado local fuerte.
+- Combina ambos backends para máxima redundancia.
+- Monitorea las cuotas diarias para evitar rate limits.
+
+---
+
+**Spider-back** te da un sistema de backup "araña" distribuido, cifrado, verificable y de muy bajo coste usando infraestructuras públicas.
