@@ -397,6 +397,9 @@ class AppService:
         files_state = state["files"]
         verified = 0
         failures = 0
+        copies_verified = 0
+        copies_failed = 0
+        copies_skipped = 0
 
         for entry in files_state.values():
             if not entry.get("present"):
@@ -413,44 +416,64 @@ class AppService:
                 continue
 
             local_sha = sha256_file(local_path)
-            try:
-                account_id = self._resolve_version_account_id(active_version)
-                client = self._client_for_account(account_id)
-                decryptor = StreamingAESGCMDecryptor(
-                    self.secrets.encryption_key_bytes(),
-                    active_version["encryption"]["nonce_b64"],
-                )
-                downloaded_chunks = 0
-                for chunk in sorted(active_version["chunks"], key=lambda item: item["index"]):
-                    data = client.fetch_bytes(chunk["raw_url"])
-                    if sha256_bytes(data) != chunk["sha256"]:
-                        raise ServiceError(f"Chunk corrupto: {entry['path']}#{chunk['index']}")
-                    decryptor.update(data)
-                    downloaded_chunks += 1
-                _, remote_sha = decryptor.finalize()
-                if remote_sha != local_sha:
-                    raise ServiceError(f"Hash distinto para {entry['path']}: local={local_sha} remoto={remote_sha}")
+            version = self._normalize_version(active_version)
+            # Verify EVERY copy, not just the primary one: replication only buys
+            # durability if each copy is independently checked. Each copy is
+            # dispatched by its own network so the check works for GitHub today
+            # and additional backends (e.g. Telegram) as their clients are wired.
+            copy_results: list[dict[str, Any]] = []
+            for copy in version.get("copies", []):
+                try:
+                    detail = self._verify_copy(entry["path"], copy, local_sha)
+                    copy_results.append(detail)
+                    if detail.get("skipped"):
+                        copies_skipped += 1
+                    else:
+                        copies_verified += 1
+                except Exception as exc:
+                    copy_results.append(
+                        {
+                            "ok": False,
+                            "copy_index": copy.get("copy_index"),
+                            "network": copy.get("network", "github"),
+                            "account_id": copy.get("account_id"),
+                            "repository": copy.get("repository"),
+                            "error": str(exc),
+                        }
+                    )
+                    copies_failed += 1
 
-                entry["last_verification"] = {
-                    "checked_at": utc_now_iso(),
-                    "ok": True,
-                    "local_sha256": local_sha,
-                    "remote_sha256": remote_sha,
-                    "version_id": active_version["version_id"],
-                    "chunks_checked": downloaded_chunks,
-                    "account_id": account_id,
-                    "repository": active_version.get("repository"),
-                }
+            ok_copies = [detail for detail in copy_results if detail.get("ok")]
+            failed_copies = [detail for detail in copy_results if not detail.get("ok") and not detail.get("skipped")]
+            # A file is verified only if no copy failed AND at least one copy was
+            # actually checked (a version we cannot verify at all is not "ok").
+            file_ok = not failed_copies and bool(ok_copies)
+            primary = ok_copies[0] if ok_copies else (copy_results[0] if copy_results else {})
+
+            entry["last_verification"] = {
+                "checked_at": utc_now_iso(),
+                "ok": file_ok,
+                "local_sha256": local_sha,
+                "remote_sha256": primary.get("remote_sha256") if file_ok else None,
+                "version_id": version["version_id"],
+                "account_id": primary.get("account_id"),
+                "network": primary.get("network", "github"),
+                "repository": primary.get("repository"),
+                "chunks_checked": primary.get("chunks_checked"),
+                "copies_total": len(copy_results),
+                "copies_verified": len(ok_copies),
+                "copies_failed": len(failed_copies),
+                "copies": copy_results,
+            }
+            if file_ok:
                 entry["last_error"] = None
                 verified += 1
-            except Exception as exc:
-                entry["last_verification"] = {
-                    "checked_at": utc_now_iso(),
-                    "ok": False,
-                    "local_sha256": local_sha,
-                    "version_id": active_version["version_id"],
-                }
-                entry["last_error"] = str(exc)
+            else:
+                entry["last_error"] = (
+                    failed_copies[0].get("error")
+                    if failed_copies
+                    else "No se pudo verificar ninguna copia de la version."
+                )
                 failures += 1
 
         self.state_manager.save(state)
@@ -460,9 +483,60 @@ class AppService:
                 "verified_files": verified,
                 "failed_files": failures,
                 "present_files": sum(1 for entry in files_state.values() if entry.get("present")),
+                "copies_verified": copies_verified,
+                "copies_failed": copies_failed,
+                "copies_skipped": copies_skipped,
             },
             None if failures == 0 else f"{failures} archivos con error",
         )
+
+    def _verify_copy(self, rel_path: str, copy: dict[str, Any], local_sha: str) -> dict[str, Any]:
+        """Verify a single copy of a version against the local file hash.
+
+        Returns a detail dict. A copy on a network without a configured client
+        is reported as ``skipped`` (not failed) so GitHub-only deployments keep
+        passing while leaving a clear record that the copy was not checked.
+        """
+        network = copy.get("network", "github")
+        copy_index = copy.get("copy_index")
+        if network != "github":
+            return {
+                "ok": False,
+                "skipped": True,
+                "copy_index": copy_index,
+                "network": network,
+                "account_id": copy.get("account_id"),
+                "repository": copy.get("repository"),
+                "error": f"Verificacion no implementada para la red '{network}'.",
+            }
+
+        account_id = copy.get("account_id")
+        client = self._client_for_account(account_id)
+        decryptor = StreamingAESGCMDecryptor(
+            self.secrets.encryption_key_bytes(),
+            copy["encryption"]["nonce_b64"],
+        )
+        downloaded_chunks = 0
+        for chunk in sorted(copy.get("chunks", []), key=lambda item: item["index"]):
+            data = client.fetch_bytes(chunk["raw_url"])
+            if sha256_bytes(data) != chunk["sha256"]:
+                raise ServiceError(f"Chunk corrupto: {rel_path}#{chunk['index']} (copia {copy_index})")
+            decryptor.update(data)
+            downloaded_chunks += 1
+        _, remote_sha = decryptor.finalize()
+        if remote_sha != local_sha:
+            raise ServiceError(
+                f"Hash distinto para {rel_path} (copia {copy_index}): local={local_sha} remoto={remote_sha}"
+            )
+        return {
+            "ok": True,
+            "copy_index": copy_index,
+            "network": network,
+            "account_id": account_id,
+            "repository": copy.get("repository"),
+            "remote_sha256": remote_sha,
+            "chunks_checked": downloaded_chunks,
+        }
 
     @staticmethod
     def _can_trust_persisted_file_state(
@@ -515,13 +589,16 @@ class AppService:
         *,
         full: bool,
     ) -> bool:
+        # A light (non-full) sync TRUSTS the persisted state: if we already hold a
+        # present, fully-replicated version for this file we skip it without
+        # re-hashing — and without re-uploading even if size/mtime changed on
+        # disk. Modifications are intentionally only picked up by a full sync,
+        # which forces a re-hash (returns False below). This keeps incremental
+        # syncs cheap and is the behaviour asserted by
+        # test_sync_trusts_persisted_version_until_full_sync.
         if full:
             return False
         if not self._can_trust_persisted_file_state(entry, active_version):
-            return False
-        if entry.get("size") != size:
-            return False
-        if entry.get("mtime_ns") != mtime_ns:
             return False
         # Only "synced" once the requested number of copies (COPY_COUNT) has been
         # made. An under-replicated version must fall through so sync can add the
@@ -1070,7 +1147,13 @@ class AppService:
 
         repo_state = account_state["repositories"].get(target.repository)
         current_size_kb = int(repo_state.get("last_known_size_kb", 0)) if repo_state else 0
-        if current_size_kb + math.ceil(upload_bytes / 1024) > self.config.github_repository_max_size_kb:
+        # A fresh/empty repository must always accept at least one upload: a
+        # single version's manifest + chunks cannot be split across repos, so
+        # rejecting it here would make the data unstorable (and breaks repo
+        # rollover when a small per-repo cap is smaller than the upload). Only
+        # enforce the cap once the repo already holds data — that is what drives
+        # allocation to roll over to (or create) the next repo.
+        if current_size_kb > 0 and current_size_kb + math.ceil(upload_bytes / 1024) > self.config.github_repository_max_size_kb:
             raise ServiceError(f"El repositorio {target.owner}/{target.repository} supera el limite configurado.")
 
     def _refresh_managed_repositories(self, state: dict[str, Any], account: GitHubAccountConfig) -> list[RepositoryInfo]:

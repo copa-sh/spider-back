@@ -66,8 +66,17 @@ class StateManager:
                 self._write(state)
                 return state
 
-            state = migrate_state(json.loads(self.state_path.read_text(encoding="utf-8")))
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            state = migrate_state(raw)
+            # Auto-sanitize: if migration had to add/normalize any field, persist
+            # the upgraded structure back to disk so the on-disk state is always
+            # current (and we don't re-run the migration every load). The volatile
+            # `config` block is compared before being overwritten so a changed
+            # effective config alone does not trigger a rewrite here.
+            structure_changed = state != raw
             state["config"] = default_config
+            if structure_changed:
+                self._write(state)
             return state
 
     def save(self, state: dict[str, Any]) -> None:

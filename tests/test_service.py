@@ -196,6 +196,45 @@ def test_sync_can_create_multiple_copies_in_distinct_accounts(tmp_path):
     assert all(copy["chunks"] for copy in version["copies"])
 
 
+def test_verify_checks_every_copy(tmp_path):
+    service, data_dir, _ = make_service(tmp_path, copy_count=2)
+    (data_dir / "archivo.txt").write_text("contenido replicado", encoding="utf-8")
+    assert service.run_sync().ok is True
+
+    verify = service.run_verify()
+    assert verify.ok is True
+    assert verify.summary["copies_verified"] == 2
+    assert verify.summary["copies_failed"] == 0
+
+    state = service.get_state()
+    last_verification = next(iter(state["files"].values()))["last_verification"]
+    assert last_verification["ok"] is True
+    assert last_verification["copies_total"] == 2
+    assert last_verification["copies_verified"] == 2
+
+
+def test_verify_detects_corrupted_secondary_copy(tmp_path):
+    service, data_dir, _ = make_service(tmp_path, copy_count=2)
+    (data_dir / "archivo.txt").write_text("contenido replicado", encoding="utf-8")
+    assert service.run_sync().ok is True
+
+    # Corrupt the chunks of the SECOND copy only. The legacy verify (primary
+    # copy only) would have missed this; the copy-aware verify must catch it.
+    state = service.state_manager.load(service.default_config)
+    version = next(iter(state["files"].values()))["versions"][0]
+    second_copy = version["copies"][1]
+    corrupt_client = service.github_clients[second_copy["account_id"]]
+    for chunk in second_copy["chunks"]:
+        repo = chunk["repository"]
+        path = chunk["raw_url"].split("://", 1)[1].split("/", 3)[3]
+        corrupt_client.files[(repo, path)] = b"datos corruptos"
+
+    verify = service.run_verify()
+    assert verify.ok is False
+    assert verify.summary["copies_failed"] == 1
+    assert verify.summary["copies_verified"] == 1
+
+
 def test_sync_reuses_persisted_file_state_after_restart(tmp_path, monkeypatch):
     service, data_dir, _ = make_service(tmp_path)
     sample = data_dir / "archivo.txt"
@@ -210,7 +249,7 @@ def test_sync_reuses_persisted_file_state_after_restart(tmp_path, monkeypatch):
     def fail_if_hashed(path, chunk_size: int = 1024 * 1024):
         raise AssertionError(f"sha256_file no deberia ejecutarse para {path}")
 
-    monkeypatch.setattr("github_fs.service.sha256_file", fail_if_hashed)
+    monkeypatch.setattr("app.service.sha256_file", fail_if_hashed)
 
     sync = restarted_service.run_sync()
     assert sync.ok is True
@@ -240,7 +279,8 @@ def test_sync_reuses_already_uploaded_copy_via_sqlite(tmp_path):
 
 
 def test_sync_reuses_already_uploaded_copy_after_restart_via_sqlite(tmp_path):
-    service, data_dir, state_dir = make_service(tmp_path)
+    service, data_dir, _ = make_service(tmp_path)
+    state_dir = service.config.app_state_dir
     sample = data_dir / "archivo1.jpg"
     sample.write_text("contenido compartido", encoding="utf-8")
     assert service.run_sync().ok is True
