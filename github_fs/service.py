@@ -5,7 +5,6 @@ import json
 import logging
 import math
 import random
-import sqlite3
 import threading
 import time
 from copy import deepcopy
@@ -13,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+import sqlite3
 
 from .config import AppConfig, GitHubAccountConfig, RuntimeSecrets
 from .crypto import StreamingAESGCMDecryptor, chunk_bytes, encrypt_bytes
@@ -29,7 +29,7 @@ from .utils import (
 )
 
 
-LOGGER = logging.getLogger("github-fs")
+LOGGER = logging.getLogger("spider-back")
 
 
 class ServiceError(Exception):
@@ -719,7 +719,7 @@ class AppService:
                 target.repository,
                 target.branch,
                 tree_entries,
-                f"github-fs sync {utc_now_iso()} ({rel_path})",
+                f"spider-back sync {utc_now_iso()} ({rel_path})",
             )
             LOGGER.info("sync commit creado path=%s repo=%s commit=%s", rel_path, target.repository, commit_sha)
         except GitHubError as exc:

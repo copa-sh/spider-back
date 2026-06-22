@@ -38,7 +38,7 @@ Si cambia cualquiera de los archivos descritos aquí, hay impacto directo en com
 | `index.json` | JSON | Estado canónico de la aplicación: archivos, tareas, cuentas y configuración efectiva. |
 | `secrets.json` | JSON | Secretos de ejecución generados o fijados por entorno. |
 | `upload_index.sqlite3` | SQLite | Índice de desduplicación y reutilización de versiones ya subidas. |
-| `logs/github-fs.log` | Log plano | Registro operacional persistente. No forma parte del contrato de datos. |
+| `logs/spider-back.log` | Log plano | Registro operacional persistente. No forma parte del contrato de datos. |
 | `sync.lock`, `verify.lock` | Lock files | Exclusión mutua entre procesos. No contienen estado lógico. |
 
 ### `index.json`
@@ -58,7 +58,7 @@ Estructura de primer nivel:
     ],
     "branch": "main",
     "uploads_prefix": "storage",
-    "repository_prefix": "data",
+    "repository_prefix": "model",
     "repository_private": true,
     "repository_max_size_kb": 524288,
     "daily_upload_limit_gb": 5,
@@ -285,7 +285,7 @@ Reglas de descubrimiento:
 | --- | --- | --- | --- |
 | `GITHUB_BRANCH` | No | `main` | Rama destino para los blobs y commits. |
 | `GITHUB_UPLOADS_PREFIX` | No | `storage` | Prefijo remoto donde se guardan los objetos subidos. |
-| `GITHUB_REPOSITORY_PREFIX` | No | `data` | Prefijo de repositorios gestionados. El valor se normaliza quitando guiones finales. |
+| `GITHUB_REPOSITORY_PREFIX` | No | `model` | Prefijo de repositorios gestionados. El valor se normaliza quitando guiones finales. |
 | `GITHUB_REPOSITORY_PRIVATE` | No | `true` | Crea repositorios privados por defecto. |
 | `GITHUB_REPOSITORY_MAX_SIZE_KB` | Sí | - | Límite máximo de tamaño por repositorio gestionado. |
 | `GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB` | Sí | - | Límite diario de subida por cuenta. |
@@ -299,7 +299,7 @@ Reglas de descubrimiento:
 Notas de compatibilidad:
 
 - `.env.example` incluye valores de ejemplo más conservadores para `GITHUB_UPLOAD_SLEEP_MIN_SECONDS` y `GITHUB_UPLOAD_SLEEP_MAX_SECONDS`; si no se definen, el runtime no duerme entre subidas.
-- `GITHUB_REPOSITORY_PREFIX` se limpia con `strip("-")`, así que `data`, `data-` y `data--` terminan normalizándose al mismo prefijo efectivo.
+- `GITHUB_REPOSITORY_PREFIX` se limpia con `strip("-")`, así que `model`, `model-` y `model--` terminan normalizándose al mismo prefijo efectivo.
 - `GITHUB_CHUNK_SIZE_MB` se interpreta en bytes al generar chunks, pero el tamaño efectivo nunca supera 95 MB por chunk.
 
 #### Variables no implementadas en esta rama
@@ -317,7 +317,7 @@ docker compose up -d --build
 Si no definiste `APP_WEB_PIN`, revisa los logs:
 
 ```bash
-docker compose logs -f app
+docker compose logs -f spider-back
 ```
 
 ## Interfaz Web
@@ -350,7 +350,7 @@ python3 -m spider_back.main run-once-verify
 
 ## Estructura de almacenamiento
 
-- **GitHub**: Repositorios automáticos (`spider-back-0001`, `spider-back-0002`, …) con chunks en el branch configurado.
+- **GitHub**: Repositorios automáticos (`model-0001`, `model-0002`, …) con chunks en el branch configurado.
 - **`/state/index.json`**: historial completo de archivos, versiones y cuentas.
 - **`/state/secrets.json`**: PIN web, clave de cifrado y secreto Flask persistidos.
 - **`/state/upload_index.sqlite3`**: índice de versiones ya subidas y reutilizadas.

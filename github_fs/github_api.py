@@ -156,10 +156,10 @@ class GitHubClient:
                 f"No se pudo inspeccionar la rama '{branch}' de {owner}/{repo} (HTTP {response.status_code})."
             )
 
-        init_path = ".github-fs-init"
+        init_path = ".spider-back-init"
         init_content = f"Initialized at {datetime.now(timezone.utc).isoformat()}\n".encode()
         payload = {
-            "message": f"Initialize branch '{branch}' for github-fs",
+            "message": f"Initialize branch '{branch}' for spider-back",
             "content": base64.b64encode(init_content).decode(),
             "branch": branch,
         }

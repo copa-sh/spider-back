@@ -1,6 +1,7 @@
 services:
-  app:
+  spider-back:
     build: .
+    container_name: spider-back
     env_file:
       - .env
     command: gunicorn -c gunicorn.conf.py -w ${GUNICORN_WORKERS:-4} -b 0.0.0.0:${APP_WEB_PORT:-8080} github_fs.web:app

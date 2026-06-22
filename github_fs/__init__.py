@@ -1,2 +1,1 @@
-"""github-fs daemon package."""
-
+"""spider-back daemon package."""

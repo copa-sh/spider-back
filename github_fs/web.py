@@ -16,7 +16,7 @@ HOME_TEMPLATE = """
 <!doctype html>
 <html lang="es">
   <body>
-    <h1>github-fs</h1>
+    <h1>spider-back</h1>
     <p><strong>Ultima sync:</strong> {{ state.tasks.sync.last_finished_at or "nunca" }} ({{ state.tasks.sync.last_result }})</p>
     <p><strong>Ultima verificacion:</strong> {{ state.tasks.verify.last_finished_at or "nunca" }} ({{ state.tasks.verify.last_result }})</p>
     <p><strong>Proxima sync programada aprox.:</strong> {{ next_sync }}</p>
@@ -96,7 +96,7 @@ LOGIN_TEMPLATE = """
 <!doctype html>
 <html lang="es">
   <body>
-    <h1>Acceso github-fs</h1>
+    <h1>Acceso spider-back</h1>
     {% if error %}<p>{{ error }}</p>{% endif %}
     <form method="post">
       <label for="pin">PIN</label>
@@ -269,7 +269,7 @@ def create_web_app(service: AppService) -> Flask:
     def logs():
         requested_lines = request.args.get("lines", "200")
         line_count = _parse_line_count(requested_lines)
-        log_path = service.config.app_state_dir / "logs" / "github-fs.log"
+        log_path = service.config.app_state_dir / "logs" / "spider-back.log"
         content, error = _read_tail(log_path, line_count)
         return render_template_string(
             LOGS_TEMPLATE,

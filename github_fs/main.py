@@ -11,11 +11,11 @@ from .web import create_web_app
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOGGER = logging.getLogger("github-fs")
+LOGGER = logging.getLogger("spider-back")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="github-fs daemon")
+    parser = argparse.ArgumentParser(description="spider-back daemon")
     sub = parser.add_subparsers(dest="command", required=False)
     sub.add_parser("daemon", help="Ejecuta el demonio completo")
     sub.add_parser("scheduler", help="Ejecuta solo los schedulers de sync y verify")

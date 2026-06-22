@@ -9,7 +9,7 @@ from .service import AppService
 from .state import StateManager
 
 
-LOGGER = logging.getLogger("github-fs")
+LOGGER = logging.getLogger("spider-back")
 LOG_FORMAT = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
 
@@ -51,7 +51,7 @@ class SchedulerThread(threading.Thread):
 
 def bootstrap_service() -> AppService:
     config = load_config()
-    configure_file_logging(config.app_state_dir / "logs" / "github-fs.log")
+    configure_file_logging(config.app_state_dir / "logs" / "spider-back.log")
     state_manager = StateManager(config.app_state_dir)
     secrets, generated = state_manager.bootstrap_secrets(config.app_web_pin, config.app_encryption_key)
     if generated["encryption_key"]:
