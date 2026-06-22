@@ -329,7 +329,6 @@ Reglas de descubrimiento:
 | `GITHUB_REPOSITORY_PRIVATE` | No | `true` | Crea repositorios privados por defecto. |
 | `GITHUB_REPOSITORY_MAX_SIZE_KB` | Sí | - | Límite máximo de tamaño por repositorio gestionado. |
 | `GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB` | Sí | - | Límite diario de subida por cuenta. |
-| `COPY_COUNT` | No | `1` | Número de copias de cada versión. Cada copia se coloca entera en una cuenta distinta (de cualquier red: GitHub, Telegram, etc.). Antes se llamaba `GITHUB_COPY_COUNT`, que sigue aceptándose por compatibilidad. |
 | `GITHUB_CHUNK_SIZE_MB` | No | `24` | Tamaño nominal de fragmentación. El código lo recorta a un máximo efectivo de `95 MB`. |
 | `GITHUB_TIMEOUT_SECONDS` | No | `300` | Timeout de peticiones GitHub. |
 | `GITHUB_MAX_RETRY` | No | `3` | Número de reintentos HTTP. |
@@ -337,17 +336,19 @@ Reglas de descubrimiento:
 | `GITHUB_UPLOAD_SLEEP_MIN_SECONDS` | No | `0` | Límite inferior del sleep entre subidas. |
 | `GITHUB_UPLOAD_SLEEP_MAX_SECONDS` | No | `0` | Límite superior del sleep entre subidas. Debe ser mayor o igual que el mínimo. |
 
+#### Variables genéricas de redes
+> Afectan a todas las redes por igual
+
+| Variable | Requerida | Valor por defecto efectivo | Efecto |
+| --- | --- | --- | --- |
+| `COPY_COUNT` | No | `1` | Número de copias de cada versión. Cada copia se coloca entera en una cuenta distinta (de cualquier red: GitHub, Telegram, etc.). |
+
 Notas de compatibilidad:
 
 - `.env.example` incluye valores de ejemplo más conservadores para `GITHUB_UPLOAD_SLEEP_MIN_SECONDS` y `GITHUB_UPLOAD_SLEEP_MAX_SECONDS`; si no se definen, el runtime no duerme entre subidas.
 - `GITHUB_REPOSITORY_PREFIX` se limpia con `strip("-")`, así que `model`, `model-` y `model--` terminan normalizándose al mismo prefijo efectivo.
-- `COPY_COUNT` (o el antiguo `GITHUB_COPY_COUNT`) debe ser menor o igual que el número total de cuentas configuradas en todas las redes. Dos copias bajo una misma cuenta cuentan como una sola.
+- `COPY_COUNT` debe ser menor o igual que el número total de cuentas configuradas en todas las redes. Dos copias bajo una misma cuenta cuentan como una sola.
 - `GITHUB_CHUNK_SIZE_MB` se interpreta en bytes al generar chunks, pero el tamaño efectivo nunca supera 95 MB por chunk.
-
-#### Variables no implementadas en esta rama
-
-- En este árbol no aparecen variables `TELEGRAM_*` en el runtime ni en los tests.
-- Si la versión de producción que quieres comparar usa Telegram, conviene documentar esas variables en un bloque separado para no mezclar contratos distintos.
 
 ## Docker
 
