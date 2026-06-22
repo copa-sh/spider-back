@@ -1,4 +1,4 @@
-from github_fs.crypto import StreamingAESGCMDecryptor, decrypt_bytes, encrypt_bytes
+from app.crypto import StreamingAESGCMDecryptor, decrypt_bytes, encrypt_bytes
 
 
 def test_encrypt_decrypt_roundtrip():

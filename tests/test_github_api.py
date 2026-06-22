@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from github_fs.github_api import GitHubClient, GitHubSettings
+from app.github_api import GitHubClient, GitHubSettings
 
 
 class DummyResponse:

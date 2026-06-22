@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from github_fs.utils import add_seconds_iso, iter_files, rel_path_str, stable_file_id
+from app.utils import add_seconds_iso, iter_files, rel_path_str, stable_file_id
 
 
 def test_stable_file_id_is_stable():

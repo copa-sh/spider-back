@@ -3,11 +3,11 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from github_fs.config import AppConfig, GitHubAccountConfig, RuntimeSecrets
-from github_fs.github_api import GitHubError
-from github_fs.service import AppService
-from github_fs.state import StateManager
-from github_fs.web import create_web_app
+from app.config import AppConfig, GitHubAccountConfig, RuntimeSecrets
+from app.github_api import GitHubError
+from app.service import AppService
+from app.state import StateManager
+from app.web import create_web_app
 
 
 class FakeRepositoryInfo:
@@ -532,7 +532,7 @@ def test_home_verified_count_requires_version_match(tmp_path):
     state["files"][file_id]["active_version_id"] = "different-version-id"
     service.state_manager.save(state)
 
-    from github_fs.web import HOME_TEMPLATE  # noqa: F401  (sanity import)
+    from app.web import HOME_TEMPLATE  # noqa: F401  (sanity import)
 
     with app.test_request_context("/"):
         # Re-fetch via the route to exercise the count.

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from github_fs.service import AppService
+from app.service import AppService
 
 
 def _version(copies, requested):

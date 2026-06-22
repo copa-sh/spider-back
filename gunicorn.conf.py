@@ -4,7 +4,7 @@ import logging
 import os
 from pathlib import Path
 
-from github_fs.runtime import bootstrap_service, configure_file_logging, start_scheduler_threads, stop_scheduler_threads
+from app.runtime import bootstrap_service, configure_file_logging, start_scheduler_threads, stop_scheduler_threads
 
 
 _scheduler_threads = None

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from github_fs.state_migrations import migrate_index_file
+from app.state_migrations import migrate_index_file
 
 
 def main() -> int:

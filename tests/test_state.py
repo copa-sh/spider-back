@@ -1,6 +1,6 @@
 import json
 
-from github_fs.state import StateManager
+from app.state import StateManager
 
 
 def test_bootstrap_secrets_creates_file(tmp_path):

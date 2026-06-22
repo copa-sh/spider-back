@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from github_fs.config import ConfigError, generate_encryption_key, generate_pin, load_config
+from app.config import ConfigError, generate_encryption_key, generate_pin, load_config
 
 
 def _base_env(tmp_path) -> dict[str, str]:
