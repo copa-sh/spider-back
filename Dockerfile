@@ -12,4 +12,4 @@ COPY . .
 
 EXPOSE 8080
 
-CMD ["gunicorn", "-c", "gunicorn.conf.py", "-w", "4", "-b", "0.0.0.0:8080", "github_fs.web:app"]
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "-w", "4", "-b", "0.0.0.0:8080", "app.web:app"]

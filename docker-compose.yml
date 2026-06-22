@@ -4,7 +4,7 @@ services:
     container_name: spider-back
     env_file:
       - .env
-    command: gunicorn -c gunicorn.conf.py -w ${GUNICORN_WORKERS:-4} -b 0.0.0.0:${APP_WEB_PORT:-8080} github_fs.web:app
+    command: gunicorn -c gunicorn.conf.py -w ${GUNICORN_WORKERS:-4} -b 0.0.0.0:${APP_WEB_PORT:-8080} app.web:app
     ports:
       - "${APP_WEB_PORT:-8080}:${APP_WEB_PORT:-8080}"
     volumes:
