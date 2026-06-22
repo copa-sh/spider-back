@@ -24,12 +24,18 @@ HOME_TEMPLATE = """
     <p><strong>Sync en curso:</strong> {{ "si" if state.tasks.sync.running else "no" }}</p>
     <p><strong>Verificacion en curso:</strong> {{ "si" if state.tasks.verify.running else "no" }}</p>
     <p><strong>Archivos presentes:</strong> {{ stats.present }}</p>
-    <p><strong>Archivos completos en GitHub:</strong> {{ stats.uploaded }}</p>
+    <p><strong>Archivos subidos:</strong> {{ stats.uploaded }}</p>
     <p><strong>Archivos verificados:</strong> {{ stats.verified }}</p>
     <p><strong>Archivos ausentes:</strong> {{ stats.absent }}</p>
     <p><strong>Archivos con error:</strong> {{ stats.with_error }}</p>
     <p><strong>Total de versiones:</strong> {{ stats.total_versions }}</p>
     <p><strong>Total de copias:</strong> {{ stats.total_copies }}</p>
+    <h2>Cobertura de copias (cuentas distintas)</h2>
+    <ul>
+      {% for bucket in stats.copy_distribution %}
+      <li><strong>{{ bucket.threshold }}+ copias:</strong> {{ bucket.percent }}% ({{ bucket.count }} archivos)</li>
+      {% endfor %}
+    </ul>
     <h2>Cuentas GitHub</h2>
     <ul>
       {% for account in state.github_account_summaries %}
@@ -231,7 +237,30 @@ def create_web_app(service: AppService) -> Flask:
     @require_login
     def home():
         state = service.get_state()
-        files = state["files"].values()
+        files = list(state["files"].values())
+
+        def _active_version(item):
+            active_id = item.get("active_version_id")
+            for version in item.get("versions", []):
+                if version.get("version_id") == active_id:
+                    return version
+            return None
+
+        # Per-file distinct-account copy count of the active version (two copies
+        # under the same account count as one — see distinct_account_copy_count).
+        per_file_copies = [
+            service.distinct_account_copy_count(_active_version(item)) for item in files
+        ]
+        total_files = len(files)
+        copy_count_target = service.config.copy_count
+        copy_distribution = []
+        for threshold in range(1, copy_count_target + 1):
+            with_at_least = sum(1 for count in per_file_copies if count >= threshold)
+            percent = round(with_at_least / total_files * 100, 1) if total_files else 0.0
+            copy_distribution.append(
+                {"threshold": threshold, "count": with_at_least, "percent": percent}
+            )
+
         stats = {
           "present": sum(1 for item in files if item.get("present")),
           "uploaded": sum(1 for item in files if item.get("active_version_id")),
@@ -249,6 +278,8 @@ def create_web_app(service: AppService) -> Flask:
               for item in files
               for version in item.get("versions", [])
           ),
+          "copy_count_target": copy_count_target,
+          "copy_distribution": copy_distribution,
         }
         next_sync = _next_run_text(state["tasks"]["sync"]["last_finished_at"], service.config.app_sync_interval_seconds)
         next_verify = _next_run_text(state["tasks"]["verify"]["last_finished_at"], service.config.app_verify_interval_seconds)

@@ -111,7 +111,7 @@ def make_service_for_dirs(
         github_repository_private=True,
         github_repository_max_size_kb=repo_limit_kb,
         github_account_daily_upload_limit_gb=daily_limit_gb,
-        github_copy_count=copy_count,
+        copy_count=copy_count,
         github_chunk_size_mb=1,
         github_timeout_seconds=30,
         github_max_retry=1,
