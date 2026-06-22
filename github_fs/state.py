@@ -66,7 +66,12 @@ class StateManager:
 
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
             state["config"] = default_config
-            state.setdefault("tasks", self._default_state(default_config)["tasks"])
+            default_tasks = self._default_state(default_config)["tasks"]
+            tasks = state.setdefault("tasks", default_tasks)
+            for task_name, task_defaults in default_tasks.items():
+                task_state = tasks.setdefault(task_name, {})
+                for key, value in task_defaults.items():
+                    task_state.setdefault(key, value)
             state.setdefault("files", {})
             state.setdefault("github_accounts", {})
             state.setdefault("created_at", utc_now_iso())
@@ -92,15 +97,6 @@ class StateManager:
             "config": default_config,
             "tasks": {
                 "sync": {
-                    "last_started_at": None,
-                    "last_finished_at": None,
-                    "last_result": "never",
-                    "last_error": None,
-                    "last_summary": {},
-                    "last_manual_trigger_at": None,
-                    "running": False,
-                },
-                "sync_by_name": {
                     "last_started_at": None,
                     "last_finished_at": None,
                     "last_result": "never",

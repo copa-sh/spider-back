@@ -17,13 +17,11 @@ HOME_TEMPLATE = """
 <html lang="es">
   <body>
     <h1>github-fs</h1>
-    <p><strong>Ultima sync manual:</strong> {{ state.tasks.sync.last_finished_at or "nunca" }} ({{ state.tasks.sync.last_result }})</p>
-    <p><strong>Ultima sync programada:</strong> {{ state.tasks.sync_by_name.last_finished_at or "nunca" }} ({{ state.tasks.sync_by_name.last_result }})</p>
+    <p><strong>Ultima sync:</strong> {{ state.tasks.sync.last_finished_at or "nunca" }} ({{ state.tasks.sync.last_result }})</p>
     <p><strong>Ultima verificacion:</strong> {{ state.tasks.verify.last_finished_at or "nunca" }} ({{ state.tasks.verify.last_result }})</p>
     <p><strong>Proxima sync programada aprox.:</strong> {{ next_sync }}</p>
     <p><strong>Proxima verificacion aprox.:</strong> {{ next_verify }}</p>
     <p><strong>Sync en curso:</strong> {{ "si" if state.tasks.sync.running else "no" }}</p>
-    <p><strong>Sync por nombre en curso:</strong> {{ "si" if state.tasks.sync_by_name.running else "no" }}</p>
     <p><strong>Verificacion en curso:</strong> {{ "si" if state.tasks.verify.running else "no" }}</p>
     <p><strong>Archivos presentes:</strong> {{ stats.present }}</p>
     <p><strong>Archivos completos en GitHub:</strong> {{ stats.uploaded }}</p>
@@ -82,9 +80,6 @@ HOME_TEMPLATE = """
     </form>
     <form method="post" action="{{ url_for('trigger_full_sync') }}">
       <button type="submit">Verificar y Sincronizar Todo</button>
-    </form>
-    <form method="post" action="{{ url_for('trigger_sync_by_name') }}">
-      <button type="submit">Subir Solo Archivos Nuevos</button>
     </form>
     <form method="post" action="{{ url_for('trigger_verify') }}">
       <button type="submit">Lanzar verificacion de integridad</button>
@@ -200,7 +195,6 @@ def create_web_app(service: AppService) -> Flask:
         task_name_map = {
             "run_sync": "sync",
             "run_full_sync": "sync",
-            "run_sync_by_name": "sync_by_name",
             "run_verify": "verify",
         }
         task_name = task_name_map[method_name]
@@ -295,12 +289,6 @@ def create_web_app(service: AppService) -> Flask:
     @require_login
     def trigger_full_sync():
         run_background("run_full_sync")
-        return redirect(url_for("home"))
-
-    @app.post("/actions/sync-by-name")
-    @require_login
-    def trigger_sync_by_name():
-        run_background("run_sync_by_name")
         return redirect(url_for("home"))
 
     @app.post("/actions/verify")

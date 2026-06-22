@@ -122,7 +122,6 @@ python3 -m spider_back.main web-dev
 python3 -m spider_back.main scheduler
 python3 -m spider_back.main run-once-sync
 python3 -m spider_back.main run-once-full-sync
-python3 -m spider_back.main run-once-sync-by-name
 python3 -m spider_back.main run-once-verify
 ```
 

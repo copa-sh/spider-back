@@ -18,7 +18,29 @@ def test_load_initial_state(tmp_path):
     state = manager.load({"repository": "owner/repo"})
     assert state["files"] == {}
     assert state["tasks"]["sync"]["last_result"] == "never"
-    assert state["tasks"]["sync_by_name"]["last_result"] == "never"
+    assert "sync_by_name" not in state["tasks"]
+    assert state["tasks"]["verify"]["last_result"] == "never"
+
+
+def test_load_migrates_legacy_sync_by_name_task(tmp_path):
+    manager = StateManager(tmp_path)
+    manager.save(
+        {
+            "created_at": "x",
+            "config": {"repository": "old/repo"},
+            "tasks": {
+                "sync": {"last_result": "success"},
+                "sync_by_name": {"last_result": "never"},
+                "verify": {"last_result": "never"},
+            },
+            "files": {},
+        }
+    )
+
+    state = manager.load({"repository": "new/repo"})
+    assert "sync_by_name" not in state["tasks"]
+    assert state["tasks"]["sync"]["last_result"] == "success"
+    assert state["tasks"]["verify"]["last_result"] == "never"
 
 
 def test_load_replaces_effective_config(tmp_path):

@@ -22,7 +22,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("web-dev", help="Ejecuta solo la web con el servidor de desarrollo de Flask")
     sub.add_parser("run-once-sync", help="Ejecuta una sincronizacion ligera basada en el estado persistido")
     sub.add_parser("run-once-full-sync", help="Ejecuta una sincronizacion completa validando el contenido real")
-    sub.add_parser("run-once-sync-by-name", help="Ejecuta una sincronizacion ligera por nombre")
     sub.add_parser("run-once-verify", help="Ejecuta una verificacion")
     parser.set_defaults(command="daemon")
     return parser
@@ -69,10 +68,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run-once-full-sync":
             result = service.run_full_sync()
             LOGGER.info("Full sync result: %s", result.summary)
-            return 0 if result.ok else 1
-        if args.command == "run-once-sync-by-name":
-            result = service.run_sync_by_name()
-            LOGGER.info("Sync by name result: %s", result.summary)
             return 0 if result.ok else 1
         if args.command == "run-once-verify":
             result = service.run_verify()

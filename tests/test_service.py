@@ -155,38 +155,6 @@ def test_sync_verify_and_repo_metadata_are_persisted(tmp_path):
     assert state["files"][file_id]["last_verification"]["remote_sha256"] == state["files"][file_id]["source_sha256"]
 
 
-def test_sync_by_name_skips_known_files_without_hashing_them(tmp_path, monkeypatch):
-    service, data_dir, _ = make_service(tmp_path)
-    known = data_dir / "archivo1.jpg"
-    known.write_bytes(b"contenido conocido")
-
-    first_sync = service.run_sync()
-    assert first_sync.ok is True
-
-    new_file = data_dir / "archivo2.jpg"
-    new_file.write_bytes(b"contenido nuevo")
-
-    hashed_paths: list[str] = []
-
-    def fake_sha256_file(path, chunk_size: int = 1024 * 1024):
-        hashed_paths.append(path.name)
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-
-    monkeypatch.setattr("github_fs.service.sha256_file", fake_sha256_file)
-
-    sync = service.run_sync_by_name()
-    assert sync.ok is True
-    assert sync.summary["skipped_files"] == 1
-    assert sync.summary["uploaded_files"] == 1
-    assert "archivo1.jpg" not in hashed_paths
-    assert "archivo2.jpg" in hashed_paths
-
-    state = service.get_state()
-    assert len(state["files"]) == 2
-    new_entry = state["files"][next(file_id for file_id, entry in state["files"].items() if entry["path"] == "archivo2.jpg")]
-    assert new_entry["versions"][0]["repository"] == "github-fs-0001"
-
-
 def test_sync_reuses_persisted_file_state_after_restart(tmp_path, monkeypatch):
     service, data_dir, _ = make_service(tmp_path)
     sample = data_dir / "archivo.txt"
@@ -208,6 +176,47 @@ def test_sync_reuses_persisted_file_state_after_restart(tmp_path, monkeypatch):
     assert sync.summary["scanned_files"] == 1
     assert sync.summary["uploaded_files"] == 0
     assert sync.summary["failed_files"] == 0
+
+
+def test_sync_reuses_already_uploaded_copy_via_sqlite(tmp_path):
+    service, data_dir, _ = make_service(tmp_path)
+    first = data_dir / "archivo1.jpg"
+    second = data_dir / "subdir" / "archivo2.jpg"
+    first.write_text("contenido duplicado", encoding="utf-8")
+    second.parent.mkdir(parents=True)
+    second.write_text("contenido duplicado", encoding="utf-8")
+
+    sync = service.run_sync()
+    assert sync.ok is True
+    assert sync.summary["uploaded_files"] == 1
+    assert sync.summary["reused_files"] == 1
+
+    state = service.get_state()
+    entries = list(state["files"].values())
+    assert len(entries) == 2
+    active_versions = {entry["active_version_id"] for entry in entries}
+    assert len(active_versions) == 1
+
+
+def test_sync_reuses_already_uploaded_copy_after_restart_via_sqlite(tmp_path):
+    service, data_dir, state_dir = make_service(tmp_path)
+    sample = data_dir / "archivo1.jpg"
+    sample.write_text("contenido compartido", encoding="utf-8")
+    assert service.run_sync().ok is True
+
+    copied = data_dir / "archivo2.jpg"
+    copied.write_text("contenido compartido", encoding="utf-8")
+
+    restarted_service, _, _ = make_service_for_dirs(data_dir, state_dir)
+    restarted_service.github_clients = service.github_clients
+
+    sync = restarted_service.run_sync()
+    assert sync.ok is True
+    assert sync.summary["uploaded_files"] == 0
+    assert sync.summary["reused_files"] == 1
+
+    state = restarted_service.get_state()
+    assert len(state["files"]) == 2
 
 
 def test_sync_trusts_persisted_version_until_full_sync(tmp_path):
@@ -429,59 +438,6 @@ def test_state_reflects_when_sync_lock_is_held(tmp_path):
         assert acquired is True
         state = service.get_state()
         assert state["tasks"]["sync"]["running"] is True
-
-
-def test_sync_by_name_reuploads_when_file_changed_in_place(tmp_path):
-    """A file replaced in-place under the same path must be re-uploaded.
-
-    Regression: previously sync_by_name skipped any file whose file_id had a
-    persisted active version, regardless of whether size/mtime had changed.
-    """
-    service, data_dir, _ = make_service(tmp_path)
-    sample = data_dir / "archivo.bin"
-    sample.write_bytes(b"original")
-
-    first = service.run_sync_by_name()
-    assert first.ok is True
-    assert first.summary["uploaded_files"] == 1
-
-    state_before = service.get_state()
-    file_id = next(iter(state_before["files"].keys()))
-    original_version_id = state_before["files"][file_id]["active_version_id"]
-
-    # Replace the file in place — different size AND different mtime.
-    sample.write_bytes(b"new contents that are longer")
-
-    second = service.run_sync_by_name()
-    assert second.ok is True
-    assert second.summary["uploaded_files"] == 1
-    assert second.summary["skipped_files"] == 0
-
-    state_after = service.get_state()
-    entry = state_after["files"][file_id]
-    assert entry["active_version_id"] != original_version_id
-    assert len(entry["versions"]) == 2
-
-
-def test_sync_by_name_still_skips_truly_unchanged_files(tmp_path, monkeypatch):
-    """The fast-path skip must remain when size and mtime both match."""
-    service, data_dir, _ = make_service(tmp_path)
-    sample = data_dir / "archivo.bin"
-    sample.write_bytes(b"stable contents")
-
-    first = service.run_sync_by_name()
-    assert first.ok is True
-
-    # Second pass without any modification — must skip without hashing.
-    def fail_if_hashed(path, chunk_size: int = 1024 * 1024):
-        raise AssertionError(f"sha256_file should not run for unchanged {path}")
-
-    monkeypatch.setattr("github_fs.service.sha256_file", fail_if_hashed)
-
-    second = service.run_sync_by_name()
-    assert second.ok is True
-    assert second.summary["skipped_files"] == 1
-    assert second.summary["uploaded_files"] == 0
 
 
 def test_new_version_invalidates_prior_verification(tmp_path):

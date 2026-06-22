@@ -66,7 +66,7 @@ def bootstrap_service() -> AppService:
 
 
 def start_scheduler_threads(service: AppService) -> tuple[SchedulerThread, SchedulerThread]:
-    sync_thread = SchedulerThread("sync-scheduler", service.config.app_sync_interval_seconds, service.run_sync_by_name)
+    sync_thread = SchedulerThread("sync-scheduler", service.config.app_sync_interval_seconds, service.run_sync)
     verify_thread = SchedulerThread("verify-scheduler", service.config.app_verify_interval_seconds, service.run_verify)
     sync_thread.start()
     verify_thread.start()

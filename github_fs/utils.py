@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
@@ -36,11 +37,11 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
             digest.update(block)
     return digest.hexdigest()
 
-
 def iter_files(root: Path) -> Iterable[Path]:
-    for path in sorted(root.rglob("*")):
-        if path.is_file():
-            yield path
+    archivos = [path for path in root.rglob("*") if path.is_file()]
+    random.shuffle(archivos)
+    for path in archivos:
+        yield path
 
 
 def rel_path_str(root: Path, file_path: Path) -> str:
