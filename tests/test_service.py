@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from app.config import AppConfig, GitHubAccountConfig, RuntimeSecrets
+from app.config import AppConfig, GitHubAccountConfig, TelegramAccountConfig, RuntimeSecrets
 from app.github_api import GitHubError
 from app.service import AppService
 from app.state import StateManager
@@ -70,6 +70,119 @@ class FakeGitHubClient:
         _, payload = url.split("://", 1)
         owner, repo, _branch, path = payload.split("/", 3)
         return self.files[(repo, path)]
+
+
+class FakeChannelInfo:
+    def __init__(self, chat_id: int, title: str, is_private: bool = True):
+        self.chat_id = chat_id
+        self.title = title
+        self.is_private = is_private
+
+
+class FakeTelegramClient:
+    def __init__(self, account_id: str):
+        self.account_id = account_id
+        self._channels: list[FakeChannelInfo] = []
+        self._next_chat_id = -1001000000001
+        self._next_message_id = 200
+
+    def list_managed_channels(self, prefix: str) -> list[FakeChannelInfo]:
+        return [ch for ch in self._channels if ch.title.startswith(prefix)]
+
+    def create_channel(self, title: str) -> FakeChannelInfo:
+        ch = FakeChannelInfo(self._next_chat_id, title)
+        self._next_chat_id -= 1
+        self._channels.append(ch)
+        return ch
+
+    def commit_copy(
+        self,
+        chat_id: int,
+        version_id: str,
+        chunks_data: list,
+        chunk_filenames: list,
+        *,
+        sleep_after_upload=None,
+    ) -> dict:
+        chunks_meta = []
+        uploaded_bytes = 0
+        for index, data in enumerate(chunks_data):
+            self._next_message_id += 1
+            message_id = self._next_message_id
+            chunks_meta.append(
+                {
+                    "index": index,
+                    "message_id": message_id,
+                    "file_unique_id": f"uid-{message_id}",
+                    "size": len(data),
+                    "network": "telegram",
+                }
+            )
+            uploaded_bytes += len(data)
+            if sleep_after_upload is not None:
+                sleep_after_upload()
+        self._next_message_id += 1
+        manifest_id = self._next_message_id
+        manifest_size = 256
+        uploaded_bytes += manifest_size
+        return {
+            "network": "telegram",
+            "channel_id": chat_id,
+            "manifest_message_id": manifest_id,
+            "manifest_file_unique_id": f"uid-{manifest_id}",
+            "uploaded_bytes": uploaded_bytes,
+            "chunks": chunks_meta,
+        }
+
+
+def make_service_with_telegram(tmp_path: Path):
+    data_dir = tmp_path / "datos"
+    state_dir = tmp_path / "state"
+    data_dir.mkdir()
+    state_dir.mkdir()
+    tg_account = TelegramAccountConfig("tg_account_1", 123456, "hash-abc", "+34600000001")
+    config = AppConfig(
+        github_accounts=(GitHubAccountConfig("account_1", "owner-a", "token-a"),),
+        github_branch="main",
+        github_uploads_prefix="storage",
+        github_repository_prefix="model",
+        github_repository_private=True,
+        github_repository_max_size_kb=2048,
+        github_account_daily_upload_limit_gb=1,
+        copy_count=2,
+        github_chunk_size_mb=1,
+        github_timeout_seconds=30,
+        github_max_retry=1,
+        github_backoff_seconds=1,
+        github_upload_sleep_min_seconds=0.0,
+        github_upload_sleep_max_seconds=0.0,
+        app_data_dir=data_dir,
+        app_state_dir=state_dir,
+        app_web_host="127.0.0.1",
+        app_web_port=8080,
+        app_sync_interval_seconds=60,
+        app_verify_interval_seconds=120,
+        app_web_pin="12345678",
+        app_encryption_key=None,
+        telegram_accounts=(tg_account,),
+    )
+    secrets = RuntimeSecrets(
+        encryption_key="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        web_pin="12345678",
+        flask_secret_key="secret",
+    )
+    manager = StateManager(state_dir)
+    service = AppService(
+        config, secrets, manager,
+        chooser=lambda items: items[0],
+        sleep_sampler=lambda low, high: 0.0,
+        sleeper=lambda _: None,
+    )
+    service.github_clients = {"account_1": FakeGitHubClient("owner-a")}
+    service.telegram_clients = {"tg_account_1": FakeTelegramClient("tg_account_1")}
+    service.telegram_account_by_id = {"tg_account_1": tg_account}
+    manager.load(service.default_config)
+    return service, data_dir
 
 
 def make_service(
@@ -616,3 +729,38 @@ def test_file_detail_labels_source_sha_as_upload_time(tmp_path):
     body = response.data.decode("utf-8")
     assert "SHA local" not in body
     assert "SHA al subir" in body
+
+
+def test_sync_places_copy_on_each_network(tmp_path):
+    service, data_dir = make_service_with_telegram(tmp_path)
+    (data_dir / "archivo.txt").write_bytes(b"contenido de prueba para telegram")
+
+    sync = service.run_sync()
+    assert sync.ok is True
+
+    state = service.get_state()
+    version = next(iter(state["files"].values()))["versions"][0]
+    assert version["copy_count_requested"] == 2
+    assert version["copy_count_completed"] == 2
+    assert version["replication_complete"] is True
+    assert len(version["copies"]) == 2
+    networks = {copy["network"] for copy in version["copies"]}
+    assert networks == {"github", "telegram"}
+    assert service.distinct_account_copy_count(version) == 2
+
+
+def test_verify_skips_telegram_copy_but_passes_github(tmp_path):
+    service, data_dir = make_service_with_telegram(tmp_path)
+    (data_dir / "archivo.txt").write_bytes(b"contenido de prueba para telegram")
+
+    assert service.run_sync().ok is True
+
+    verify = service.run_verify()
+    assert verify.ok is True
+    assert verify.summary["copies_verified"] >= 1
+    assert verify.summary["copies_skipped"] == 1
+    assert verify.summary["copies_failed"] == 0
+
+    state = service.get_state()
+    file_entry = next(iter(state["files"].values()))
+    assert file_entry["last_verification"]["ok"] is True

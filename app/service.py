@@ -19,9 +19,10 @@ try:
 except ImportError:  # pragma: no cover - fallback for local environments
     import sqlite3
 
-from .config import AppConfig, GitHubAccountConfig, RuntimeSecrets
+from .config import AppConfig, GitHubAccountConfig, TelegramAccountConfig, RuntimeSecrets
 from .crypto import StreamingAESGCMDecryptor, chunk_bytes, encrypt_bytes, encrypt_bytes_with_nonce
 from .github_api import GitHubClient, GitHubError, GitHubSettings, RepositoryInfo
+from .telegram_api import TelegramClient, TelegramError, TelegramSettings
 from .state import StateManager
 from .utils import (
     iter_files,
@@ -109,6 +110,22 @@ class AppService:
             for account in config.github_accounts
         }
         self.account_by_id = {account.account_id: account for account in config.github_accounts}
+        self.telegram_clients = {
+            acc.account_id: TelegramClient(
+                TelegramSettings(
+                    api_id=acc.api_id,
+                    api_hash=acc.api_hash,
+                    phone_number=acc.phone,
+                    session_name=acc.account_id,
+                    timeout_s=config.tg_timeout_seconds,
+                    max_retry=config.tg_max_retry,
+                    backoff_s=config.tg_backoff_seconds,
+                    session_dir=str(config.app_state_dir),
+                )
+            )
+            for acc in config.telegram_accounts
+        }
+        self.telegram_account_by_id = {acc.account_id: acc for acc in config.telegram_accounts}
         self._task_locks = {"sync": threading.Lock(), "verify": threading.Lock()}
         self._task_lock_paths = {
             "sync": self.config.app_state_dir / "sync.lock",
@@ -954,6 +971,79 @@ class AppService:
             "uploaded_bytes": uploaded_bytes,
         }
 
+    def _upload_telegram_version_copy(
+        self,
+        state: dict[str, Any],
+        *,
+        file_id: str,
+        rel_path: str,
+        size: int,
+        mtime_ns: int,
+        source_sha256: str,
+        version_id: str,
+        version_created_at: str,
+        encrypted: dict[str, Any],
+        chunk_items: list[tuple[int, bytes]],
+        account: TelegramAccountConfig,
+        copy_index: int,
+        copy_count: int,
+    ) -> dict[str, Any]:
+        client = self.telegram_clients[account.account_id]
+        LOGGER.info(
+            "sync telegram destino elegido path=%s copia=%s/%s cuenta=%s chunks=%s",
+            rel_path, copy_index, copy_count, account.account_id, len(chunk_items),
+        )
+        channels = client.list_managed_channels(self.config.tg_channel_prefix)
+        if channels:
+            channel = channels[0]
+        else:
+            channel = client.create_channel(f"{self.config.tg_channel_prefix}-0001")
+
+        chunks_data = [chunk for (idx, chunk) in chunk_items]
+        chunk_filenames = [f"{file_id}_{version_id}_chunk_{idx:04d}.bin" for (idx, _) in chunk_items]
+
+        tg = client.commit_copy(
+            channel.chat_id,
+            version_id,
+            chunks_data,
+            chunk_filenames,
+            sleep_after_upload=self._sleep_after_upload,
+        )
+
+        self._record_uploaded_bytes(state, account.account_id, tg["uploaded_bytes"])
+
+        return {
+            "copy_index": copy_index,
+            "network": "telegram",
+            "version_id": version_id,
+            "created_at": version_created_at,
+            "file_id": file_id,
+            "path": rel_path,
+            "plaintext_sha256": encrypted["plaintext_sha256"],
+            "ciphertext_sha256": encrypted["ciphertext_sha256"],
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "source_sha256": source_sha256,
+            "account_id": account.account_id,
+            "channel_id": channel.chat_id,
+            "channel_title": channel.title,
+            "manifest_message_id": tg["manifest_message_id"],
+            "manifest_file_unique_id": tg["manifest_file_unique_id"],
+            "encryption": {
+                "algorithm": encrypted["algorithm"],
+                "nonce_b64": encrypted["nonce_b64"],
+                "key_id": "state-default",
+            },
+            "chunks": tg["chunks"],
+            "uploaded_bytes": tg["uploaded_bytes"],
+            "repository_owner": None,
+            "repository": None,
+            "branch": None,
+            "manifest_path": None,
+            "manifest_raw_url": None,
+            "commit_sha": None,
+        }
+
     def _upload_file_version(
         self,
         state: dict[str, Any],
@@ -1033,6 +1123,43 @@ class AppService:
                 remaining_accounts = [account for account in remaining_accounts if account.account_id != target.account_id]
                 continue
 
+        # Fase 2: colocar copias restantes en cuentas Telegram
+        remaining_telegram_accounts = [
+            acc for acc in self.config.telegram_accounts
+            if acc.account_id not in used_account_ids
+        ]
+        for tg_account in remaining_telegram_accounts:
+            if len(copies) >= copy_count:
+                break
+            try:
+                copy = self._upload_telegram_version_copy(
+                    state,
+                    file_id=file_id,
+                    rel_path=rel_path,
+                    size=size,
+                    mtime_ns=mtime_ns,
+                    source_sha256=source_sha256,
+                    version_id=version_id,
+                    version_created_at=version_created_at,
+                    encrypted=encrypted,
+                    chunk_items=chunk_items,
+                    account=tg_account,
+                    copy_index=len(copies) + 1,
+                    copy_count=copy_count,
+                )
+                copies.append(copy)
+                used_account_ids.add(tg_account.account_id)
+            except (TelegramError, ServiceError) as exc:
+                copy_errors.append(
+                    {
+                        "copy_index": len(copies) + 1,
+                        "account_id": tg_account.account_id,
+                        "network": "telegram",
+                        "error": str(exc),
+                    }
+                )
+                used_account_ids.add(tg_account.account_id)
+
         if not copies:
             raise NoAvailableAccountsError("Ninguna cuenta GitHub tiene cuota diaria disponible para esta subida.")
 
@@ -1048,7 +1175,7 @@ class AppService:
             "size": size,
             "mtime_ns": mtime_ns,
             "source_sha256": source_sha256,
-            "network": "github",
+            "network": primary_copy.get("network", "github"),
             "copy_count_requested": copy_count,
             "copy_count_completed": len(copies),
             "replication_complete": len(copies) >= copy_count,
@@ -1343,12 +1470,15 @@ class AppService:
 
     def _account_state(self, state: dict[str, Any], account_id: str, owner: str | None = None) -> dict[str, Any]:
         github_accounts = state.setdefault("github_accounts", {})
+        is_telegram = account_id in self.telegram_account_by_id
+        default_network = "telegram" if is_telegram else "github"
+        default_owner = owner or self.account_by_id.get(account_id, GitHubAccountConfig(account_id, "", "")).owner
         payload = github_accounts.setdefault(
             account_id,
             {
                 "account_id": account_id,
-                "owner": owner or self.account_by_id.get(account_id, GitHubAccountConfig(account_id, "", "")).owner,
-                "network": "github",
+                "owner": default_owner,
+                "network": default_network,
                 "repositories": {},
                 "daily_uploads": {},
                 "last_metadata_refresh_at": None,
@@ -1361,7 +1491,7 @@ class AppService:
         )
         if owner:
             payload["owner"] = owner
-        payload.setdefault("network", "github")
+        payload.setdefault("network", default_network)
         payload.setdefault("repositories", {})
         payload.setdefault("daily_uploads", {})
         payload.setdefault("available", True)

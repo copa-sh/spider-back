@@ -83,3 +83,40 @@ def test_copy_count_cannot_exceed_account_total(tmp_path):
     with patch.dict("os.environ", env, clear=True):
         with pytest.raises(ConfigError):
             load_config()
+
+
+def test_load_config_parses_telegram_accounts(tmp_path):
+    env = _base_env(tmp_path)
+    env["TG_ACCOUNT_1_API_ID"] = "123456"
+    env["TG_ACCOUNT_1_API_HASH"] = "abc123hash"
+    env["TG_ACCOUNT_1_PHONE"] = "+34600000001"
+    with patch.dict("os.environ", env, clear=True):
+        config = load_config()
+    assert len(config.telegram_accounts) == 1
+    assert config.telegram_accounts[0].account_id == "tg_account_1"
+    assert config.telegram_accounts[0].api_id == 123456
+    assert config.telegram_accounts[0].api_hash == "abc123hash"
+    assert config.telegram_accounts[0].phone == "+34600000001"
+    assert config.telegram_accounts[0].network == "telegram"
+
+
+def test_copy_count_includes_telegram_accounts(tmp_path):
+    env = _base_env(tmp_path)
+    env["TG_ACCOUNT_1_API_ID"] = "123456"
+    env["TG_ACCOUNT_1_API_HASH"] = "abc123hash"
+    env["TG_ACCOUNT_1_PHONE"] = "+34600000001"
+    env["COPY_COUNT"] = "2"
+    with patch.dict("os.environ", env, clear=True):
+        config = load_config()
+    assert config.copy_count == 2
+    assert len(config.telegram_accounts) == 1
+
+
+def test_telegram_account_requires_all_three_fields(tmp_path):
+    env = _base_env(tmp_path)
+    env["TG_ACCOUNT_1_API_ID"] = "123456"
+    env["TG_ACCOUNT_1_API_HASH"] = "abc123hash"
+    # PHONE missing
+    with patch.dict("os.environ", env, clear=True):
+        with pytest.raises(ConfigError):
+            load_config()
