@@ -32,7 +32,7 @@ def test_create_repository_forces_private_and_auto_init(monkeypatch):
         captured["json"] = kwargs["json"]
         return DummyResponse(201, {"name": "repo-test", "size": 0, "private": True})
 
-    monkeypatch.setattr("github_fs.github_api.requests.request", fake_request)
+    monkeypatch.setattr("app.github_api.requests.request", fake_request)
 
     info = client.create_repository("owner-a", "repo-test", private=False)
 
