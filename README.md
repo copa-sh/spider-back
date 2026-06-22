@@ -10,6 +10,7 @@ Funciona como una segunda capa de cifrado y fragmentación sobre el contenido de
 - Cifrado doble: `gocryptfs` (opcional) + AES-256-GCM propio.
 - Fragmentación en chunks configurables.
 - Detección de cambios por hash + sincronización ligera por nombre (rápida).
+- Copias múltiples por versión repartidas entre cuentas GitHub distintas.
 - Verificación periódica de integridad reconstruyendo desde los backends remotos.
 - Gestión automática de cuotas diarias y creación de repositorios.
 - Interfaz web mínima con autenticación por PIN.
@@ -22,8 +23,8 @@ Funciona como una segunda capa de cifrado y fragmentación sobre el contenido de
 1. Lee archivos en `/datos` (solo lectura).
 2. Cifra cada archivo con AES-256-GCM usando `APP_ENCRYPTION_KEY`.
 3. Divide en chunks.
-4. Elige aleatoriamente un backend (GitHub o Telegram) con cuota disponible.
-5. Sube los chunks y guarda la ubicación en el índice.
+4. Elige una o varias cuentas de cualquier backend (network) (ej: Github, Telegram, etc ...) con cuota disponible para crear las copias de la versión.
+5. Sube todos los chunks de cada copia a una sola cuenta y guarda la ubicación en el índice.
 6. Periódicamente verifica la integridad descargando y comparando.
 
 ## Estado persistente y compatibilidad
@@ -54,7 +55,7 @@ Estructura de primer nivel:
     "data_dir": "/datos",
     "state_dir": "/state",
     "github_accounts": [
-      { "account_id": "account_1", "owner": "tuusuario" }
+      { "account_id": "account_1", "owner": "tuusuario", "network": "github" }
     ],
     "branch": "main",
     "uploads_prefix": "storage",
@@ -62,6 +63,7 @@ Estructura de primer nivel:
     "repository_private": true,
     "repository_max_size_kb": 524288,
     "daily_upload_limit_gb": 5,
+    "copy_count": 1,
     "web_host": "0.0.0.0",
     "web_port": 8080,
     "sync_interval_seconds": 604800,
@@ -85,7 +87,7 @@ Notas importantes:
 - `created_at` marca el instante en que el estado fue creado por primera vez.
 - `tasks` siempre contiene, como mínimo, `sync` y `verify`.
 - `files` es un mapa indexado por `file_id` estable.
-- `github_accounts` es un mapa indexado por `account_id`.
+- `github_accounts` es un mapa indexado por `account_id`. Cada cuenta conserva su `network` efectivo.
 
 #### `tasks.sync` y `tasks.verify`
 
@@ -148,6 +150,11 @@ Cada elemento de `versions` es un objeto completo de versión con, como mínimo:
 - `chunks`
 - `commit_sha`
 - `uploaded_bytes`
+- `copies`
+- `copy_count_requested`
+- `copy_count_completed`
+- `replication_complete`
+- `copy_errors`
 
 El bloque `encryption` contiene:
 
@@ -166,12 +173,30 @@ El bloque `chunks` contiene una lista de fragmentos con:
 - `repository_owner`
 - `account_id`
 
+El bloque `copies` contiene las replicas completas de una misma version.
+Cada copia vive por completo dentro de una sola cuenta GitHub y todos sus trozos se almacenan siempre en esa misma cuenta.
+Cada elemento de `copies` incluye, como minimo:
+
+- `copy_index`
+- `network`
+- `account_id`
+- `repository_owner`
+- `repository`
+- `branch`
+- `manifest_path`
+- `manifest_raw_url`
+- `commit_sha`
+- `uploaded_bytes`
+- `encryption`
+- `chunks`
+
 #### `github_accounts`
 
 Cada cuenta GitHub mantiene su propio subestado:
 
 - `account_id`
 - `owner`
+- `network`
 - `repositories`
 - `daily_uploads`
 - `last_metadata_refresh_at`
@@ -185,6 +210,7 @@ Dentro de `repositories`, cada repositorio conocido guarda:
 
 - `name`
 - `owner`
+- `network`
 - `last_known_size_kb`
 - `private`
 - `last_refreshed_at`
@@ -195,6 +221,20 @@ Dentro de `repositories`, cada repositorio conocido guarda:
 - Si faltan claves nuevas al cargar una versión vieja, el sistema las rellena con valores por defecto sin romper el resto del estado.
 - El estado se va guardando durante `sync` cada cierto número de archivos para no perder progreso intermedio.
 - `verify` solo actualiza los campos de verificación y errores, sin reescribir la historia completa de versiones.
+
+### Migraciones manuales
+
+Si tu `index.json` es anterior a este cambio, puedes migrarlo manualmente con:
+
+```bash
+python3 migrations/001_add_network_and_copies.py /state/index.json
+```
+
+La migración:
+
+- Añade `network=github` a las cuentas y repositorios existentes.
+- Envuelve cada version antigua en `copies` con una sola copia.
+- Conserva el resto del estado tal cual.
 
 ### `secrets.json`
 
@@ -289,6 +329,7 @@ Reglas de descubrimiento:
 | `GITHUB_REPOSITORY_PRIVATE` | No | `true` | Crea repositorios privados por defecto. |
 | `GITHUB_REPOSITORY_MAX_SIZE_KB` | Sí | - | Límite máximo de tamaño por repositorio gestionado. |
 | `GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB` | Sí | - | Límite diario de subida por cuenta. |
+| `GITHUB_COPY_COUNT` | No | `1` | Número de copias de cada version. Cada copia se coloca entera en una cuenta GitHub distinta. |
 | `GITHUB_CHUNK_SIZE_MB` | No | `24` | Tamaño nominal de fragmentación. El código lo recorta a un máximo efectivo de `95 MB`. |
 | `GITHUB_TIMEOUT_SECONDS` | No | `300` | Timeout de peticiones GitHub. |
 | `GITHUB_MAX_RETRY` | No | `3` | Número de reintentos HTTP. |
@@ -300,6 +341,7 @@ Notas de compatibilidad:
 
 - `.env.example` incluye valores de ejemplo más conservadores para `GITHUB_UPLOAD_SLEEP_MIN_SECONDS` y `GITHUB_UPLOAD_SLEEP_MAX_SECONDS`; si no se definen, el runtime no duerme entre subidas.
 - `GITHUB_REPOSITORY_PREFIX` se limpia con `strip("-")`, así que `model`, `model-` y `model--` terminan normalizándose al mismo prefijo efectivo.
+- `GITHUB_COPY_COUNT` debe ser menor o igual que el número de cuentas GitHub configuradas.
 - `GITHUB_CHUNK_SIZE_MB` se interpreta en bytes al generar chunks, pero el tamaño efectivo nunca supera 95 MB por chunk.
 
 #### Variables no implementadas en esta rama
@@ -350,7 +392,7 @@ python3 -m spider_back.main run-once-verify
 
 ## Estructura de almacenamiento
 
-- **GitHub**: Repositorios automáticos (`model-0001`, `model-0002`, …) con chunks en el branch configurado.
+- **GitHub**: Repositorios automáticos (`model-0001`, `model-0002`, …) con chunks de una copia completa. Cada copia vive entera dentro de una sola cuenta.
 - **`/state/index.json`**: historial completo de archivos, versiones y cuentas.
 - **`/state/secrets.json`**: PIN web, clave de cifrado y secreto Flask persistidos.
 - **`/state/upload_index.sqlite3`**: índice de versiones ya subidas y reutilizadas.

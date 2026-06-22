@@ -13,6 +13,10 @@ from .utils import sha256_bytes
 
 def encrypt_bytes(plaintext: bytes, key: bytes) -> dict:
     nonce = secrets.token_bytes(12)
+    return encrypt_bytes_with_nonce(plaintext, key, nonce)
+
+
+def encrypt_bytes_with_nonce(plaintext: bytes, key: bytes, nonce: bytes) -> dict:
     aesgcm = AESGCM(key)
     ciphertext = aesgcm.encrypt(nonce, plaintext, None)
     return {

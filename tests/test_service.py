@@ -72,15 +72,34 @@ class FakeGitHubClient:
         return self.files[(repo, path)]
 
 
-def make_service(tmp_path: Path, *, daily_limit_gb: float = 1, repo_limit_kb: int = 2048):
+def make_service(
+    tmp_path: Path,
+    *,
+    daily_limit_gb: float = 1,
+    repo_limit_kb: int = 2048,
+    copy_count: int = 1,
+):
     data_dir = tmp_path / "datos"
     state_dir = tmp_path / "state"
     data_dir.mkdir()
     state_dir.mkdir()
-    return make_service_for_dirs(data_dir, state_dir, daily_limit_gb=daily_limit_gb, repo_limit_kb=repo_limit_kb)
+    return make_service_for_dirs(
+        data_dir,
+        state_dir,
+        daily_limit_gb=daily_limit_gb,
+        repo_limit_kb=repo_limit_kb,
+        copy_count=copy_count,
+    )
 
 
-def make_service_for_dirs(data_dir: Path, state_dir: Path, *, daily_limit_gb: float = 1, repo_limit_kb: int = 2048):
+def make_service_for_dirs(
+    data_dir: Path,
+    state_dir: Path,
+    *,
+    daily_limit_gb: float = 1,
+    repo_limit_kb: int = 2048,
+    copy_count: int = 1,
+):
     config = AppConfig(
         github_accounts=(
             GitHubAccountConfig("account_1", "owner-a", "token-a"),
@@ -88,10 +107,11 @@ def make_service_for_dirs(data_dir: Path, state_dir: Path, *, daily_limit_gb: fl
         ),
         github_branch="main",
         github_uploads_prefix="storage",
-        github_repository_prefix="github-fs",
+        github_repository_prefix="model",
         github_repository_private=True,
         github_repository_max_size_kb=repo_limit_kb,
         github_account_daily_upload_limit_gb=daily_limit_gb,
+        github_copy_count=copy_count,
         github_chunk_size_mb=1,
         github_timeout_seconds=30,
         github_max_retry=1,
@@ -143,16 +163,37 @@ def test_sync_verify_and_repo_metadata_are_persisted(tmp_path):
     file_id, entry = next(iter(state["files"].items()))
     version = entry["versions"][0]
     assert version["account_id"] == "account_1"
-    assert version["repository"] == "github-fs-0001"
-    assert state["github_accounts"]["account_1"]["repositories"]["github-fs-0001"]["last_known_size_kb"] >= 1
+    assert version["repository"] == "model-0001"
+    assert version["replication_complete"] is True
+    assert len(version["copies"]) == 1
+    assert state["github_accounts"]["account_1"]["repositories"]["model-0001"]["last_known_size_kb"] >= 1
     assert sampled_sleeps
-    assert ("github-fs-0001", "main") in service.github_clients["account_1"].initialized_branches
+    assert ("model-0001", "main") in service.github_clients["account_1"].initialized_branches
 
     verify = service.run_verify()
     assert verify.ok is True
     state = service.get_state()
     assert state["files"][file_id]["last_verification"]["account_id"] == "account_1"
     assert state["files"][file_id]["last_verification"]["remote_sha256"] == state["files"][file_id]["source_sha256"]
+
+
+def test_sync_can_create_multiple_copies_in_distinct_accounts(tmp_path):
+    service, data_dir, _ = make_service(tmp_path, copy_count=2)
+    sample = data_dir / "archivo.txt"
+    sample.write_text("contenido replicado", encoding="utf-8")
+
+    sync = service.run_sync()
+    assert sync.ok is True
+
+    state = service.get_state()
+    version = next(iter(state["files"].values()))["versions"][0]
+    assert version["copy_count_requested"] == 2
+    assert version["copy_count_completed"] == 2
+    assert version["replication_complete"] is True
+    assert len(version["copies"]) == 2
+    assert {copy["account_id"] for copy in version["copies"]} == {"account_1", "account_2"}
+    assert all(copy["network"] == "github" for copy in version["copies"])
+    assert all(copy["chunks"] for copy in version["copies"])
 
 
 def test_sync_reuses_persisted_file_state_after_restart(tmp_path, monkeypatch):
@@ -255,7 +296,7 @@ def test_sync_trusts_persisted_version_until_full_sync(tmp_path):
 def test_creates_new_repository_when_existing_one_is_full(tmp_path):
     service, data_dir, _ = make_service(tmp_path, repo_limit_kb=1)
     client = service.github_clients["account_1"]
-    client.repositories["github-fs-0001"] = FakeRepositoryInfo("owner-a", "github-fs-0001", size_kb=1)
+    client.repositories["model-0001"] = FakeRepositoryInfo("owner-a", "model-0001", size_kb=1)
     (data_dir / "archivo.txt").write_text("hola", encoding="utf-8")
 
     sync = service.run_sync()
@@ -263,7 +304,7 @@ def test_creates_new_repository_when_existing_one_is_full(tmp_path):
 
     state = service.get_state()
     version = next(iter(state["files"].values()))["versions"][0]
-    assert version["repository"] == "github-fs-0002"
+    assert version["repository"] == "model-0002"
 
 
 def test_uses_second_account_when_first_reaches_daily_limit(tmp_path):
@@ -293,7 +334,7 @@ def test_reports_actionable_error_when_token_cannot_create_repository(tmp_path):
     service, data_dir, _ = make_service(tmp_path, repo_limit_kb=1)
     client = service.github_clients["account_1"]
     second_client = service.github_clients["account_2"]
-    client.repositories["github-fs-0001"] = FakeRepositoryInfo("owner-a", "github-fs-0001", size_kb=1)
+    client.repositories["model-0001"] = FakeRepositoryInfo("owner-a", "model-0001", size_kb=1)
     client.create_repository_error = GitHubError(
         'HTTP 403: {"message":"Resource not accessible by personal access token","status":"403"}'
     )
@@ -305,7 +346,7 @@ def test_reports_actionable_error_when_token_cannot_create_repository(tmp_path):
     state = service.get_state()
     version = next(iter(state["files"].values()))["versions"][0]
     assert version["account_id"] == "account_2"
-    assert second_client.created_repositories == ["github-fs-0001"]
+    assert second_client.created_repositories == ["model-0001"]
     account_1_state = state["github_accounts"]["account_1"]
     assert account_1_state["available"] is False
     assert "retirada del pool activo" in account_1_state["unavailable_reason"]
@@ -327,7 +368,7 @@ def test_removes_account_from_active_pool_when_pat_cannot_access_repositories(tm
     state = service.get_state()
     version = next(iter(state["files"].values()))["versions"][0]
     assert version["account_id"] == "account_2"
-    assert fallback_client.created_repositories == ["github-fs-0001"]
+    assert fallback_client.created_repositories == ["model-0001"]
     account_1_state = state["github_accounts"]["account_1"]
     assert account_1_state["available"] is False
     assert account_1_state["alerts"][0]["code"] == "personal_access_token_forbidden"
@@ -380,7 +421,7 @@ def test_web_login_and_manual_actions(tmp_path):
 
     home = client.get("/")
     assert home.status_code == 200
-    assert b"github-fs" in home.data
+    assert b"spider-back" in home.data
     assert b"account_1" in home.data
 
     trigger = client.post("/actions/verify")
@@ -393,7 +434,7 @@ def test_web_login_and_manual_actions(tmp_path):
 def test_home_shows_github_account_alerts_table(tmp_path):
     service, data_dir, _ = make_service(tmp_path, repo_limit_kb=1)
     blocked_client = service.github_clients["account_1"]
-    blocked_client.repositories["github-fs-0001"] = FakeRepositoryInfo("owner-a", "github-fs-0001", size_kb=1)
+    blocked_client.repositories["model-0001"] = FakeRepositoryInfo("owner-a", "model-0001", size_kb=1)
     blocked_client.create_repository_error = GitHubError(
         'HTTP 403: {"message":"Resource not accessible by personal access token","status":"403"}'
     )
@@ -414,10 +455,10 @@ def test_home_shows_github_account_alerts_table(tmp_path):
 
 def test_web_logs_view_reads_persisted_log_file(tmp_path):
     service, _, _ = make_service(tmp_path)
-    log_path = service.config.app_state_dir / "logs" / "github-fs.log"
+    log_path = service.config.app_state_dir / "logs" / "spider-back.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(
-        "2026-05-25 10:00:00 INFO github-fs primero\n2026-05-25 10:00:01 WARNING github-fs segundo\n",
+        "2026-05-25 10:00:00 INFO spider-back primero\n2026-05-25 10:00:01 WARNING spider-back segundo\n",
         encoding="utf-8",
     )
 

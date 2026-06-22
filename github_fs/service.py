@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import base64
 import json
 import logging
 import math
@@ -12,10 +13,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
-import sqlite3
+
+try:
+    import pysqlite3 as sqlite3
+except ImportError:  # pragma: no cover - fallback for local environments
+    import sqlite3
 
 from .config import AppConfig, GitHubAccountConfig, RuntimeSecrets
-from .crypto import StreamingAESGCMDecryptor, chunk_bytes, encrypt_bytes
+from .crypto import StreamingAESGCMDecryptor, chunk_bytes, encrypt_bytes, encrypt_bytes_with_nonce
 from .github_api import GitHubClient, GitHubError, GitHubSettings, RepositoryInfo
 from .state import StateManager
 from .utils import (
@@ -72,13 +77,17 @@ class AppService:
         self.default_config = {
             "data_dir": str(config.app_data_dir),
             "state_dir": str(config.app_state_dir),
-            "github_accounts": [{"account_id": account.account_id, "owner": account.owner} for account in config.github_accounts],
+            "github_accounts": [
+                {"account_id": account.account_id, "owner": account.owner, "network": "github"}
+                for account in config.github_accounts
+            ],
             "branch": config.github_branch,
             "uploads_prefix": config.github_uploads_prefix,
             "repository_prefix": config.github_repository_prefix,
             "repository_private": config.github_repository_private,
             "repository_max_size_kb": config.github_repository_max_size_kb,
             "daily_upload_limit_gb": config.github_account_daily_upload_limit_gb,
+            "copy_count": config.github_copy_count,
             "web_host": config.app_web_host,
             "web_port": config.app_web_port,
             "sync_interval_seconds": config.app_sync_interval_seconds,
@@ -235,7 +244,7 @@ class AppService:
         LOGGER.info("sync escaneando directorio=%s modo=%s", self.config.app_data_dir, "full" if full else "light")
         files_state = state["files"]
         discovered_paths: set[str] = set()
-        changed_files: list[tuple[str, Path, str, int, int, str]] = []
+        pending_files: list[dict[str, Any]] = []
         scanned_files = 0
         unchanged_files = 0
         last_scan_log_at = time.monotonic()
@@ -262,7 +271,7 @@ class AppService:
                     LOGGER.info(
                         "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
                         scanned_files,
-                        len(changed_files),
+                        len(pending_files),
                         unchanged_files,
                         rel_path,
                     )
@@ -276,12 +285,35 @@ class AppService:
                 entry["source_sha256"] = source_sha256
                 entry["present"] = True
                 entry["last_seen_at"] = utc_now_iso()
-                unchanged_files += 1
+                if active_version.get("replication_complete", True):
+                    unchanged_files += 1
+                    if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
+                        LOGGER.info(
+                            "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
+                            scanned_files,
+                            len(pending_files),
+                            unchanged_files,
+                            rel_path,
+                        )
+                        last_scan_log_at = time.monotonic()
+                    continue
+
+                pending_files.append(
+                    {
+                        "file_id": file_id,
+                        "file_path": file_path,
+                        "rel_path": rel_path,
+                        "size": size,
+                        "mtime_ns": mtime_ns,
+                        "source_sha256": source_sha256,
+                        "resume_version": active_version,
+                    }
+                )
                 if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
                     LOGGER.info(
                         "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
                         scanned_files,
-                        len(changed_files),
+                        len(pending_files),
                         unchanged_files,
                         rel_path,
                     )
@@ -290,6 +322,29 @@ class AppService:
 
             existing_version = self._lookup_uploaded_version(source_sha256)
             if existing_version is not None:
+                existing_version = self._normalize_version(existing_version)
+                if not existing_version.get("replication_complete", True):
+                    pending_files.append(
+                        {
+                            "file_id": file_id,
+                            "file_path": file_path,
+                            "rel_path": rel_path,
+                            "size": size,
+                            "mtime_ns": mtime_ns,
+                            "source_sha256": source_sha256,
+                            "resume_version": existing_version,
+                        }
+                    )
+                    if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
+                        LOGGER.info(
+                            "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
+                            scanned_files,
+                            len(pending_files),
+                            unchanged_files + synced_or_reused_files,
+                            rel_path,
+                        )
+                        last_scan_log_at = time.monotonic()
+                    continue
                 entry = files_state.setdefault(
                     file_id,
                     {
@@ -309,25 +364,36 @@ class AppService:
                     source_sha256=source_sha256,
                     version=existing_version,
                 )
-                self._mark_uploaded_copy_seen(source_sha256)
+                if existing_version.get("replication_complete", True):
+                    self._mark_uploaded_copy_seen(source_sha256)
                 synced_or_reused_files += 1
                 if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
                     LOGGER.info(
                         "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
                         scanned_files,
-                        len(changed_files),
+                        len(pending_files),
                         unchanged_files + synced_or_reused_files,
                         rel_path,
                     )
                     last_scan_log_at = time.monotonic()
                 continue
 
-            changed_files.append((file_id, file_path, rel_path, size, mtime_ns, source_sha256))
+            pending_files.append(
+                {
+                    "file_id": file_id,
+                    "file_path": file_path,
+                    "rel_path": rel_path,
+                    "size": size,
+                    "mtime_ns": mtime_ns,
+                    "source_sha256": source_sha256,
+                    "resume_version": None,
+                }
+            )
             if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
                 LOGGER.info(
                     "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
                     scanned_files,
-                    len(changed_files),
+                    len(pending_files),
                     unchanged_files,
                     rel_path,
                 )
@@ -336,7 +402,7 @@ class AppService:
         LOGGER.info(
             "sync analizado: %s archivos detectados, %s pendientes de subida, %s ya estaban al dia.",
             len(discovered_paths),
-            len(changed_files),
+            len(pending_files),
             unchanged_files + synced_or_reused_files,
         )
 
@@ -350,7 +416,14 @@ class AppService:
         uploaded_bytes = 0
 
         processed_since_flush = 0
-        for file_id, file_path, rel_path, size, mtime_ns, source_sha256 in changed_files:
+        for item in pending_files:
+            file_id = item["file_id"]
+            file_path = item["file_path"]
+            rel_path = item["rel_path"]
+            size = item["size"]
+            mtime_ns = item["mtime_ns"]
+            source_sha256 = item["source_sha256"]
+            resume_version = item.get("resume_version")
             entry = files_state.setdefault(
                 file_id,
                 {
@@ -363,25 +436,54 @@ class AppService:
                 },
             )
             try:
-                LOGGER.info("sync subiendo archivo path=%s size=%sB", rel_path, size)
-                version = self._upload_file_version(state, file_id, file_path, rel_path, size, mtime_ns, source_sha256)
+                LOGGER.info(
+                    "sync %sarchivo path=%s size=%sB",
+                    "completando " if resume_version else "subiendo ",
+                    rel_path,
+                    size,
+                )
+                version = self._upload_file_version(
+                    state,
+                    file_id,
+                    file_path,
+                    rel_path,
+                    size,
+                    mtime_ns,
+                    source_sha256,
+                    resume_version=resume_version,
+                )
                 entry["path"] = rel_path
                 entry["present"] = True
                 entry["size"] = size
                 entry["mtime_ns"] = mtime_ns
                 entry["source_sha256"] = source_sha256
                 entry["last_seen_at"] = utc_now_iso()
-                entry.setdefault("versions", []).append(version)
+                existing_versions = entry.setdefault("versions", [])
+                existing_index = next((idx for idx, item in enumerate(existing_versions) if item.get("version_id") == version["version_id"]), None)
+                if existing_index is None:
+                    existing_versions.append(version)
+                else:
+                    existing_versions[existing_index] = version
                 entry["active_version_id"] = version["version_id"]
                 # New version supersedes any prior verification — the stored
                 # last_verification was for the previous active version.
                 entry["last_verification"] = None
-                entry["last_error"] = None
-                uploaded_files += 1
+                if version.get("replication_complete", True):
+                    entry["last_error"] = None
+                    uploaded_files += 1
+                else:
+                    entry["last_error"] = (
+                        version.get("copy_errors", [{}])[-1].get("error")
+                        if version.get("copy_errors")
+                        else "La version no se pudo replicar completamente."
+                    )
+                    failed_files += 1
                 uploaded_bytes += version["uploaded_bytes"]
-                self._record_uploaded_version(source_sha256, version)
+                if version.get("replication_complete", True):
+                    self._record_uploaded_version(source_sha256, version)
                 LOGGER.info(
-                    "sync archivo subido path=%s cuenta=%s repo=%s version=%s bytes=%s",
+                    "sync archivo %s path=%s cuenta=%s repo=%s version=%s bytes=%s",
+                    "replicado" if version.get("replication_complete", True) else "parcial",
                     rel_path,
                     version["account_id"],
                     version["repository"],
@@ -516,6 +618,8 @@ class AppService:
             return False
         if active_version.get("plaintext_sha256") != source_sha256:
             return False
+        if not active_version.get("replication_complete", True):
+            return False
         return True
 
     def _apply_existing_version_entry(
@@ -528,6 +632,7 @@ class AppService:
         source_sha256: str,
         version: dict[str, Any],
     ) -> None:
+        version = self._normalize_version(version)
         entry["path"] = rel_path
         entry["present"] = True
         entry["size"] = size
@@ -591,7 +696,7 @@ class AppService:
             ).fetchone()
         if not row:
             return None
-        return json.loads(row[0])
+        return self._normalize_version(json.loads(row[0]))
 
     def _record_uploaded_version(self, source_sha256: str, version: dict[str, Any]) -> None:
         payload = json.dumps(version, ensure_ascii=False)
@@ -621,99 +726,223 @@ class AppService:
                 (now, source_sha256),
             )
 
-    def _upload_file_version(
+    @staticmethod
+    def _version_copies(version: dict[str, Any]) -> list[dict[str, Any]]:
+        copies = version.get("copies")
+        if copies:
+            return [deepcopy(copy) for copy in copies]
+
+        legacy_copy = {
+            "copy_index": 1,
+            "network": version.get("network", "github"),
+            "version_id": version.get("version_id"),
+            "created_at": version.get("created_at"),
+            "file_id": version.get("file_id"),
+            "path": version.get("path"),
+            "plaintext_sha256": version.get("plaintext_sha256"),
+            "ciphertext_sha256": version.get("ciphertext_sha256"),
+            "size": version.get("size"),
+            "mtime_ns": version.get("mtime_ns"),
+            "source_sha256": version.get("source_sha256"),
+            "repository_owner": version.get("repository_owner"),
+            "repository": version.get("repository"),
+            "branch": version.get("branch"),
+            "account_id": version.get("account_id"),
+            "encryption": deepcopy(version.get("encryption", {})),
+            "chunks": deepcopy(version.get("chunks", [])),
+            "manifest_path": version.get("manifest_path"),
+            "manifest_raw_url": version.get("manifest_raw_url"),
+            "commit_sha": version.get("commit_sha"),
+            "uploaded_bytes": version.get("uploaded_bytes", 0),
+        }
+        return [legacy_copy]
+
+    @classmethod
+    def _normalize_version(cls, version: dict[str, Any]) -> dict[str, Any]:
+        normalized = deepcopy(version)
+        copies = cls._version_copies(normalized)
+        for index, copy in enumerate(copies, start=1):
+            copy.setdefault("copy_index", index)
+            copy.setdefault("network", copy.get("network", normalized.get("network", "github")))
+            copy.setdefault("version_id", normalized.get("version_id"))
+            copy.setdefault("created_at", normalized.get("created_at"))
+            copy.setdefault("file_id", normalized.get("file_id"))
+            copy.setdefault("path", normalized.get("path"))
+            copy.setdefault("plaintext_sha256", normalized.get("plaintext_sha256"))
+            copy.setdefault("ciphertext_sha256", normalized.get("ciphertext_sha256"))
+            copy.setdefault("size", normalized.get("size"))
+            copy.setdefault("mtime_ns", normalized.get("mtime_ns"))
+            copy.setdefault("source_sha256", normalized.get("source_sha256"))
+            copy.setdefault("repository_owner", normalized.get("repository_owner"))
+            copy.setdefault("repository", normalized.get("repository"))
+            copy.setdefault("branch", normalized.get("branch"))
+            copy.setdefault("account_id", normalized.get("account_id"))
+            copy.setdefault("encryption", deepcopy(copy.get("encryption", normalized.get("encryption", {}))))
+            copy.setdefault("chunks", deepcopy(copy.get("chunks", normalized.get("chunks", []))))
+            copy.setdefault("manifest_path", normalized.get("manifest_path"))
+            copy.setdefault("manifest_raw_url", normalized.get("manifest_raw_url"))
+            copy.setdefault("commit_sha", normalized.get("commit_sha"))
+            copy.setdefault("uploaded_bytes", int(copy.get("uploaded_bytes", 0)))
+        normalized["copies"] = copies
+        primary = copies[0]
+        normalized.setdefault("network", primary.get("network", "github"))
+        normalized.setdefault("account_id", primary.get("account_id"))
+        normalized.setdefault("repository_owner", primary.get("repository_owner"))
+        normalized.setdefault("repository", primary.get("repository"))
+        normalized.setdefault("branch", primary.get("branch"))
+        normalized.setdefault("manifest_path", primary.get("manifest_path"))
+        normalized.setdefault("manifest_raw_url", primary.get("manifest_raw_url"))
+        normalized.setdefault("commit_sha", primary.get("commit_sha"))
+        normalized.setdefault("encryption", deepcopy(primary.get("encryption", {})))
+        normalized.setdefault("chunks", deepcopy(primary.get("chunks", [])))
+        normalized["copy_count_requested"] = int(normalized.get("copy_count_requested", len(copies)))
+        normalized["copy_count_completed"] = int(normalized.get("copy_count_completed", len(copies)))
+        normalized["replication_complete"] = bool(
+            normalized.get("replication_complete", normalized["copy_count_completed"] >= normalized["copy_count_requested"])
+        )
+        normalized.setdefault("copy_errors", [])
+        normalized["uploaded_bytes"] = int(normalized.get("uploaded_bytes", sum(int(copy.get("uploaded_bytes", 0)) for copy in copies)))
+        return normalized
+
+    def _build_copy_manifest(
+        self,
+        *,
+        file_id: str,
+        rel_path: str,
+        version_id: str,
+        version_created_at: str,
+        encrypted: dict[str, Any],
+        size: int,
+        mtime_ns: int,
+        source_sha256: str,
+        target: UploadTarget,
+        chunk_items: list[tuple[int, bytes]],
+        copy_index: int,
+        copy_count: int,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+        client = self._client_for_account(target.account_id)
+        remote_prefix = f"{self.config.github_uploads_prefix}/{file_id}/{version_id}"
+        tree_entries: list[dict[str, Any]] = []
+        chunks_payload: list[dict[str, Any]] = []
+        uploaded_bytes = 0
+
+        for chunk_position, (chunk_index, chunk) in enumerate(chunk_items, start=1):
+            LOGGER.info(
+                "sync subiendo chunk path=%s copia=%s/%s chunk=%s/%s size=%sB repo=%s",
+                rel_path,
+                copy_index,
+                copy_count,
+                chunk_position,
+                len(chunk_items),
+                len(chunk),
+                target.repository,
+            )
+            chunk_sha = client.create_blob(target.owner, target.repository, chunk)
+            self._sleep_after_upload()
+            chunk_path = f"{remote_prefix}/chunk_{chunk_index:04d}.bin"
+            tree_entries.append({"path": chunk_path, "mode": "100644", "type": "blob", "sha": chunk_sha})
+            chunks_payload.append(
+                {
+                    "index": chunk_index,
+                    "path": chunk_path,
+                    "raw_url": client.raw_url(target.owner, target.repository, target.branch, chunk_path),
+                    "sha256": sha256_bytes(chunk),
+                    "size": len(chunk),
+                    "repository": target.repository,
+                    "repository_owner": target.owner,
+                    "account_id": target.account_id,
+                    "network": "github",
+                }
+            )
+            uploaded_bytes += len(chunk)
+
+        manifest_payload: dict[str, Any] = {
+            "version": 1,
+            "file_id": file_id,
+            "path": rel_path,
+            "version_id": version_id,
+            "created_at": version_created_at,
+            "plaintext_sha256": encrypted["plaintext_sha256"],
+            "ciphertext_sha256": encrypted["ciphertext_sha256"],
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "source_sha256": source_sha256,
+            "repository_owner": target.owner,
+            "repository": target.repository,
+            "branch": target.branch,
+            "account_id": target.account_id,
+            "network": "github",
+            "copy_index": copy_index,
+            "copy_count_requested": copy_count,
+            "encryption": {
+                "algorithm": encrypted["algorithm"],
+                "nonce_b64": encrypted["nonce_b64"],
+                "key_id": "state-default",
+            },
+            "chunks": chunks_payload,
+        }
+        return manifest_payload, tree_entries, uploaded_bytes
+
+    def _upload_version_copy(
         self,
         state: dict[str, Any],
+        *,
         file_id: str,
-        file_path: Path,
         rel_path: str,
         size: int,
         mtime_ns: int,
         source_sha256: str,
+        version_id: str,
+        version_created_at: str,
+        encrypted: dict[str, Any],
+        chunk_items: list[tuple[int, bytes]],
+        target: UploadTarget,
+        copy_index: int,
+        copy_count: int,
     ) -> dict[str, Any]:
-        plaintext = file_path.read_bytes()
-        encrypted = encrypt_bytes(plaintext, self.secrets.encryption_key_bytes())
-        chunk_items = list(chunk_bytes(encrypted["ciphertext"], self.config.github_chunk_size_bytes))
-        estimated_upload_bytes = len(encrypted["ciphertext"]) + self._estimate_manifest_bytes(rel_path, len(chunk_items))
-        target = self._allocate_upload_target(state, estimated_upload_bytes)
         client = self._client_for_account(target.account_id)
         LOGGER.info(
-            "sync destino elegido path=%s cuenta=%s owner=%s repo=%s chunks=%s estimado=%sB",
+            "sync destino elegido path=%s copia=%s/%s cuenta=%s owner=%s repo=%s chunks=%s",
             rel_path,
+            copy_index,
+            copy_count,
             target.account_id,
             target.owner,
             target.repository,
             len(chunk_items),
-            estimated_upload_bytes,
         )
         try:
             client.ensure_branch_initialized(target.owner, target.repository, target.branch)
-
-            version_id = utc_now_compact()
-            remote_prefix = f"{self.config.github_uploads_prefix}/{file_id}/{version_id}"
-            tree_entries: list[dict[str, Any]] = []
-            chunks_payload: list[dict[str, Any]] = []
-            uploaded_bytes = 0
-
-            for chunk_index, chunk in chunk_items:
-                LOGGER.info(
-                    "sync subiendo chunk path=%s chunk=%s/%s size=%sB repo=%s",
-                    rel_path,
-                    chunk_index + 1,
-                    len(chunk_items),
-                    len(chunk),
-                    target.repository,
-                )
-                chunk_sha = client.create_blob(target.owner, target.repository, chunk)
-                self._sleep_after_upload()
-                chunk_path = f"{remote_prefix}/chunk_{chunk_index:04d}.bin"
-                tree_entries.append({"path": chunk_path, "mode": "100644", "type": "blob", "sha": chunk_sha})
-                chunks_payload.append(
-                    {
-                        "index": chunk_index,
-                        "path": chunk_path,
-                        "raw_url": client.raw_url(target.owner, target.repository, target.branch, chunk_path),
-                        "sha256": sha256_bytes(chunk),
-                        "size": len(chunk),
-                        "repository": target.repository,
-                        "repository_owner": target.owner,
-                        "account_id": target.account_id,
-                    }
-                )
-                uploaded_bytes += len(chunk)
-
-            version_manifest: dict[str, Any] = {
-                "version": 1,
-                "file_id": file_id,
-                "path": rel_path,
-                "version_id": version_id,
-                "created_at": utc_now_iso(),
-                "plaintext_sha256": encrypted["plaintext_sha256"],
-                "ciphertext_sha256": encrypted["ciphertext_sha256"],
-                "size": size,
-                "mtime_ns": mtime_ns,
-                "source_sha256": source_sha256,
-                "repository_owner": target.owner,
-                "repository": target.repository,
-                "branch": target.branch,
-                "account_id": target.account_id,
-                "encryption": {
-                    "algorithm": encrypted["algorithm"],
-                    "nonce_b64": encrypted["nonce_b64"],
-                    "key_id": "state-default",
-                },
-                "chunks": chunks_payload,
-            }
-
-            manifest_bytes = json.dumps(version_manifest, ensure_ascii=False, indent=2).encode("utf-8")
-            self._assert_target_capacity(state, target, uploaded_bytes + len(manifest_bytes))
-            LOGGER.info("sync subiendo manifest path=%s size=%sB repo=%s", rel_path, len(manifest_bytes), target.repository)
+            manifest_payload, tree_entries, uploaded_bytes = self._build_copy_manifest(
+                file_id=file_id,
+                rel_path=rel_path,
+                version_id=version_id,
+                version_created_at=version_created_at,
+                encrypted=encrypted,
+                size=size,
+                mtime_ns=mtime_ns,
+                source_sha256=source_sha256,
+                target=target,
+                chunk_items=chunk_items,
+                copy_index=copy_index,
+                copy_count=copy_count,
+            )
+            self._assert_target_capacity(state, target, uploaded_bytes + self._estimate_manifest_bytes(rel_path, len(chunk_items)))
+            manifest_bytes = json.dumps(manifest_payload, ensure_ascii=False, indent=2).encode("utf-8")
+            LOGGER.info(
+                "sync subiendo manifest path=%s copia=%s/%s size=%sB repo=%s",
+                rel_path,
+                copy_index,
+                copy_count,
+                len(manifest_bytes),
+                target.repository,
+            )
             manifest_sha = client.create_blob(target.owner, target.repository, manifest_bytes)
             self._sleep_after_upload()
+            remote_prefix = f"{self.config.github_uploads_prefix}/{file_id}/{version_id}"
             manifest_path = f"{remote_prefix}/manifest.json"
             tree_entries.append({"path": manifest_path, "mode": "100644", "type": "blob", "sha": manifest_sha})
             uploaded_bytes += len(manifest_bytes)
-
             commit_sha = client.commit_tree(
                 target.owner,
                 target.repository,
@@ -721,7 +950,14 @@ class AppService:
                 tree_entries,
                 f"spider-back sync {utc_now_iso()} ({rel_path})",
             )
-            LOGGER.info("sync commit creado path=%s repo=%s commit=%s", rel_path, target.repository, commit_sha)
+            LOGGER.info(
+                "sync commit creado path=%s copia=%s/%s repo=%s commit=%s",
+                rel_path,
+                copy_index,
+                copy_count,
+                target.repository,
+                commit_sha,
+            )
         except GitHubError as exc:
             if self._handle_account_access_error(state, self.account_by_id[target.account_id], exc):
                 raise ServiceError(
@@ -732,15 +968,19 @@ class AppService:
         self._record_uploaded_bytes(state, target.account_id, uploaded_bytes)
         self._bump_repository_size(state, target.account_id, target.repository, uploaded_bytes)
         return {
+            "copy_index": copy_index,
+            "network": "github",
             "version_id": version_id,
-            "created_at": version_manifest["created_at"],
+            "created_at": manifest_payload["created_at"],
             "plaintext_sha256": encrypted["plaintext_sha256"],
             "ciphertext_sha256": encrypted["ciphertext_sha256"],
             "size": size,
+            "mtime_ns": mtime_ns,
+            "source_sha256": source_sha256,
             "manifest_path": manifest_path,
             "manifest_raw_url": client.raw_url(target.owner, target.repository, target.branch, manifest_path),
-            "encryption": version_manifest["encryption"],
-            "chunks": chunks_payload,
+            "encryption": manifest_payload["encryption"],
+            "chunks": manifest_payload["chunks"],
             "commit_sha": commit_sha,
             "account_id": target.account_id,
             "repository_owner": target.owner,
@@ -749,12 +989,129 @@ class AppService:
             "uploaded_bytes": uploaded_bytes,
         }
 
-    def _allocate_upload_target(self, state: dict[str, Any], estimated_upload_bytes: int) -> UploadTarget:
+    def _upload_file_version(
+        self,
+        state: dict[str, Any],
+        file_id: str,
+        file_path: Path,
+        rel_path: str,
+        size: int,
+        mtime_ns: int,
+        source_sha256: str,
+        resume_version: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        plaintext = file_path.read_bytes()
+        base_version = self._normalize_version(resume_version) if resume_version else None
+        if base_version:
+            nonce_b64 = base_version["encryption"]["nonce_b64"]
+            nonce_padding = "=" * (-len(nonce_b64) % 4)
+            nonce = base64.urlsafe_b64decode(nonce_b64 + nonce_padding)
+            encrypted = encrypt_bytes_with_nonce(plaintext, self.secrets.encryption_key_bytes(), nonce)
+            version_id = base_version["version_id"]
+            version_created_at = base_version.get("created_at", utc_now_iso())
+            copy_count = int(base_version.get("copy_count_requested", self.config.github_copy_count))
+            used_account_ids = {copy.get("account_id") for copy in base_version.get("copies", []) if copy.get("account_id")}
+            copies: list[dict[str, Any]] = [deepcopy(copy) for copy in base_version.get("copies", [])]
+            copy_errors = list(base_version.get("copy_errors", []))
+        else:
+            encrypted = encrypt_bytes(plaintext, self.secrets.encryption_key_bytes())
+            version_id = utc_now_compact()
+            version_created_at = utc_now_iso()
+            copy_count = self.config.github_copy_count
+            used_account_ids = set()
+            copies = []
+            copy_errors = []
+
+        chunk_items = list(chunk_bytes(encrypted["ciphertext"], self.config.github_chunk_size_bytes))
+        estimated_upload_bytes = len(encrypted["ciphertext"]) + self._estimate_manifest_bytes(rel_path, len(chunk_items))
+        remaining_accounts = list(account for account in self.config.github_accounts if account.account_id not in used_account_ids)
+
+        while len(copies) < copy_count and remaining_accounts:
+            try:
+                target = self._allocate_upload_target(state, estimated_upload_bytes, excluded_account_ids=used_account_ids)
+            except NoAvailableAccountsError:
+                break
+            if target.account_id in used_account_ids:
+                remaining_accounts = [account for account in remaining_accounts if account.account_id != target.account_id]
+                continue
+            try:
+                copy = self._upload_version_copy(
+                    state,
+                    file_id=file_id,
+                    rel_path=rel_path,
+                    size=size,
+                    mtime_ns=mtime_ns,
+                    source_sha256=source_sha256,
+                    version_id=version_id,
+                    version_created_at=version_created_at,
+                    encrypted=encrypted,
+                    chunk_items=chunk_items,
+                    target=target,
+                    copy_index=len(copies) + 1,
+                    copy_count=copy_count,
+                )
+                copies.append(copy)
+                used_account_ids.add(target.account_id)
+                remaining_accounts = [account for account in remaining_accounts if account.account_id != target.account_id]
+            except NoAvailableAccountsError:
+                break
+            except ServiceError as exc:
+                copy_errors.append(
+                    {
+                        "copy_index": len(copies) + 1,
+                        "account_id": target.account_id,
+                        "network": "github",
+                        "error": str(exc),
+                    }
+                )
+                used_account_ids.add(target.account_id)
+                remaining_accounts = [account for account in remaining_accounts if account.account_id != target.account_id]
+                continue
+
+        if not copies:
+            raise NoAvailableAccountsError("Ninguna cuenta GitHub tiene cuota diaria disponible para esta subida.")
+
+        primary_copy = copies[0]
+        version: dict[str, Any] = {
+            "version": 2,
+            "file_id": file_id,
+            "path": rel_path,
+            "version_id": version_id,
+            "created_at": version_created_at,
+            "plaintext_sha256": encrypted["plaintext_sha256"],
+            "ciphertext_sha256": encrypted["ciphertext_sha256"],
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "source_sha256": source_sha256,
+            "network": "github",
+            "copy_count_requested": copy_count,
+            "copy_count_completed": len(copies),
+            "replication_complete": len(copies) >= copy_count,
+            "copy_errors": copy_errors if len(copies) < copy_count else [],
+            "copies": copies,
+            "account_id": primary_copy["account_id"],
+            "repository_owner": primary_copy["repository_owner"],
+            "repository": primary_copy["repository"],
+            "branch": primary_copy["branch"],
+            "manifest_path": primary_copy["manifest_path"],
+            "manifest_raw_url": primary_copy["manifest_raw_url"],
+            "commit_sha": primary_copy["commit_sha"],
+            "encryption": primary_copy["encryption"],
+            "chunks": primary_copy["chunks"],
+            "uploaded_bytes": sum(int(copy.get("uploaded_bytes", 0)) for copy in copies),
+        }
+        version = self._normalize_version(version)
+        return version
+
+    def _allocate_upload_target(self, state: dict[str, Any], estimated_upload_bytes: int, excluded_account_ids: set[str] | None = None) -> UploadTarget:
         eligible_accounts: list[GitHubAccountConfig] = []
         today = self._today_bucket()
         estimated_upload_kb = math.ceil(estimated_upload_bytes / 1024)
+        excluded_account_ids = excluded_account_ids or set()
 
         for account in self.config.github_accounts:
+            if account.account_id in excluded_account_ids:
+                continue
             account_state = self._account_state(state, account.account_id, owner=account.owner)
             if account.account_id in self._runtime_unavailable_accounts:
                 continue
@@ -846,6 +1203,7 @@ class AppService:
             repo_state = known.setdefault(repo.name, {})
             repo_state["name"] = repo.name
             repo_state["owner"] = repo.owner
+            repo_state["network"] = "github"
             repo_state["last_known_size_kb"] = repo.size_kb
             repo_state["private"] = repo.private
             repo_state["last_refreshed_at"] = utc_now_iso()
@@ -868,6 +1226,7 @@ class AppService:
         repo_state = self._account_state(state, account.account_id, owner=account.owner)["repositories"].setdefault(repository, {})
         repo_state["name"] = repository
         repo_state["owner"] = account.owner
+        repo_state["network"] = "github"
         repo_state["last_known_size_kb"] = info.size_kb
         repo_state["private"] = info.private
         repo_state["last_refreshed_at"] = utc_now_iso()
@@ -898,6 +1257,7 @@ class AppService:
         repo_state = account_state["repositories"].setdefault(candidate, {})
         repo_state["name"] = candidate
         repo_state["owner"] = account.owner
+        repo_state["network"] = "github"
         repo_state["last_known_size_kb"] = info.size_kb
         repo_state["private"] = info.private
         repo_state["last_refreshed_at"] = utc_now_iso()
@@ -979,9 +1339,13 @@ class AppService:
         return client
 
     def _resolve_version_account_id(self, version: dict[str, Any]) -> str:
+        version = self._normalize_version(version)
         account_id = version.get("account_id")
         if account_id:
             return account_id
+        copies = version.get("copies") or []
+        if copies:
+            return copies[0].get("account_id")
         if "legacy" in self.account_by_id:
             return "legacy"
         raise ServiceError("La version no indica account_id y no hay configuracion legacy disponible.")
@@ -994,6 +1358,7 @@ class AppService:
                 {
                     "account_id": account.account_id,
                     "owner": account.owner,
+                    "network": "github",
                     "repositories": {},
                     "daily_uploads": {},
                     "last_metadata_refresh_at": None,
@@ -1012,6 +1377,7 @@ class AppService:
             {
                 "account_id": account_id,
                 "owner": owner or self.account_by_id.get(account_id, GitHubAccountConfig(account_id, "", "")).owner,
+                "network": "github",
                 "repositories": {},
                 "daily_uploads": {},
                 "last_metadata_refresh_at": None,
@@ -1024,6 +1390,7 @@ class AppService:
         )
         if owner:
             payload["owner"] = owner
+        payload.setdefault("network", "github")
         payload.setdefault("repositories", {})
         payload.setdefault("daily_uploads", {})
         payload.setdefault("available", True)
@@ -1043,6 +1410,7 @@ class AppService:
                 {
                     "account_id": account.account_id,
                     "owner": account.owner,
+                    "network": account_state.get("network", "github"),
                     "uploaded_today_bytes": int(account_state["daily_uploads"].get(today, 0)),
                     "daily_limit_bytes": self.config.github_account_daily_upload_limit_bytes,
                     "repositories": repositories,

@@ -29,6 +29,7 @@ HOME_TEMPLATE = """
     <p><strong>Archivos ausentes:</strong> {{ stats.absent }}</p>
     <p><strong>Archivos con error:</strong> {{ stats.with_error }}</p>
     <p><strong>Total de versiones:</strong> {{ stats.total_versions }}</p>
+    <p><strong>Total de copias:</strong> {{ stats.total_copies }}</p>
     <h2>Cuentas GitHub</h2>
     <ul>
       {% for account in state.github_account_summaries %}
@@ -146,11 +147,17 @@ FILE_TEMPLATE = """
       <li>
         {{ version.version_id }} | {{ version.created_at }} |
         <a href="{{ version.manifest_raw_url }}">manifest</a> |
+        copias={{ version.copies|length }} |
         chunks={{ version.chunks|length }} |
         commit={{ version.commit_sha or "pendiente" }} |
         sha={{ version.plaintext_sha256 }} |
         cuenta={{ version.account_id }} |
         repo={{ version.repository_owner }}/{{ version.repository }}
+        <ul>
+          {% for copy in version.copies %}
+          <li>{{ copy.copy_index }}: {{ copy.network }} {{ copy.account_id }} {{ copy.repository_owner }}/{{ copy.repository }} commit={{ copy.commit_sha or "pendiente" }}</li>
+          {% endfor %}
+        </ul>
       </li>
       {% endfor %}
     </ul>
@@ -237,6 +244,11 @@ def create_web_app(service: AppService) -> Flask:
           "absent": sum(1 for item in files if not item.get("present")),
           "with_error": sum(1 for item in files if item.get("last_error")),
           "total_versions": sum(len(item.get("versions", [])) for item in files),
+          "total_copies": sum(
+              len(version.get("copies", []))
+              for item in files
+              for version in item.get("versions", [])
+          ),
         }
         next_sync = _next_run_text(state["tasks"]["sync"]["last_finished_at"], service.config.app_sync_interval_seconds)
         next_verify = _next_run_text(state["tasks"]["verify"]["last_finished_at"], service.config.app_verify_interval_seconds)

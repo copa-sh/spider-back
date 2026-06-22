@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import RuntimeSecrets, generate_encryption_key, generate_flask_secret, generate_pin
-from .utils import utc_now_iso
+from .state_migrations import migrate_state
 
 
 class StateManager:
@@ -60,21 +60,13 @@ class StateManager:
     def load(self, default_config: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             if not self.state_path.exists():
-                state = self._default_state(default_config)
+                state = migrate_state(self._default_state(default_config))
+                state["config"] = default_config
                 self._write(state)
                 return state
 
-            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            state = migrate_state(json.loads(self.state_path.read_text(encoding="utf-8")))
             state["config"] = default_config
-            default_tasks = self._default_state(default_config)["tasks"]
-            tasks = state.setdefault("tasks", default_tasks)
-            for task_name, task_defaults in default_tasks.items():
-                task_state = tasks.setdefault(task_name, {})
-                for key, value in task_defaults.items():
-                    task_state.setdefault(key, value)
-            state.setdefault("files", {})
-            state.setdefault("github_accounts", {})
-            state.setdefault("created_at", utc_now_iso())
             return state
 
     def save(self, state: dict[str, Any]) -> None:

@@ -14,6 +14,7 @@ DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_RETRY = 3
 DEFAULT_BACKOFF_SECONDS = 2
 DEFAULT_CHUNK_SIZE_MB = 24
+DEFAULT_COPY_COUNT = 1
 DEFAULT_INTERVAL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_REPOSITORY_PREFIX = "model"
 
@@ -113,6 +114,7 @@ class AppConfig:
     github_repository_private: bool
     github_repository_max_size_kb: int
     github_account_daily_upload_limit_gb: float
+    github_copy_count: int
     github_chunk_size_mb: int
     github_timeout_seconds: int
     github_max_retry: int
@@ -195,19 +197,25 @@ def load_config() -> AppConfig:
     github_repository_private = _env_bool("GITHUB_REPOSITORY_PRIVATE", True)
     github_repository_max_size_kb = _env_int("GITHUB_REPOSITORY_MAX_SIZE_KB")
     github_account_daily_upload_limit_gb = _env_float("GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB")
+    github_copy_count = _env_int("GITHUB_COPY_COUNT", DEFAULT_COPY_COUNT)
     github_upload_sleep_min_seconds = _env_float("GITHUB_UPLOAD_SLEEP_MIN_SECONDS", 0.0, allow_zero=True)
     github_upload_sleep_max_seconds = _env_float("GITHUB_UPLOAD_SLEEP_MAX_SECONDS", 0.0, allow_zero=True)
     if github_upload_sleep_min_seconds > github_upload_sleep_max_seconds:
         raise ConfigError("GITHUB_UPLOAD_SLEEP_MIN_SECONDS no puede ser mayor que GITHUB_UPLOAD_SLEEP_MAX_SECONDS.")
 
+    github_accounts = _discover_accounts()
+    if github_copy_count > len(github_accounts):
+        raise ConfigError("GITHUB_COPY_COUNT no puede ser mayor que el numero de cuentas GitHub configuradas.")
+
     config = AppConfig(
-        github_accounts=_discover_accounts(),
+        github_accounts=github_accounts,
         github_branch=github_branch,
         github_uploads_prefix=github_uploads_prefix,
         github_repository_prefix=github_repository_prefix,
         github_repository_private=github_repository_private,
         github_repository_max_size_kb=github_repository_max_size_kb,
         github_account_daily_upload_limit_gb=github_account_daily_upload_limit_gb,
+        github_copy_count=github_copy_count,
         github_chunk_size_mb=_env_int("GITHUB_CHUNK_SIZE_MB", DEFAULT_CHUNK_SIZE_MB),
         github_timeout_seconds=_env_int("GITHUB_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
         github_max_retry=_env_int("GITHUB_MAX_RETRY", DEFAULT_MAX_RETRY),

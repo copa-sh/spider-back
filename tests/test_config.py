@@ -36,7 +36,7 @@ def test_load_config_parses_numbered_accounts(tmp_path):
     with patch.dict("os.environ", _base_env(tmp_path), clear=True):
         config = load_config()
     assert [item.account_id for item in config.github_accounts] == ["account_1"]
-    assert config.github_repository_prefix == "github-fs"
+    assert config.github_repository_prefix == "model"
     assert config.github_account_daily_upload_limit_bytes == 1024**3
 
 
