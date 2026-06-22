@@ -14,7 +14,7 @@ Funciona como una segunda capa de cifrado y fragmentación sobre el contenido de
 - Gestión automática de cuotas diarias y creación de repositorios.
 - Interfaz web mínima con autenticación por PIN.
 - Scheduler integrado para sync y verify automáticos.
-- Estado persistente en `/state/index.json`.
+- Estado persistente en `/state/index.json`, `/state/secrets.json` y `/state/upload_index.sqlite3`.
 - Docker-first.
 
 ## Cómo funciona
@@ -26,69 +26,292 @@ Funciona como una segunda capa de cifrado y fragmentación sobre el contenido de
 5. Sube los chunks y guarda la ubicación en el índice.
 6. Periódicamente verifica la integridad descargando y comparando.
 
-## Variables de entorno principales
+## Estado persistente y compatibilidad
 
-Copia y edita el archivo correspondiente:
+La versión actual guarda todo su estado funcional dentro de `APP_STATE_DIR`, que por defecto es `/state`.
+Si cambia cualquiera de los archivos descritos aquí, hay impacto directo en compatibilidad con ejecuciones ya existentes.
+
+### Resumen de archivos persistentes
+
+| Archivo | Tipo | Rol |
+| --- | --- | --- |
+| `index.json` | JSON | Estado canónico de la aplicación: archivos, tareas, cuentas y configuración efectiva. |
+| `secrets.json` | JSON | Secretos de ejecución generados o fijados por entorno. |
+| `upload_index.sqlite3` | SQLite | Índice de desduplicación y reutilización de versiones ya subidas. |
+| `logs/github-fs.log` | Log plano | Registro operacional persistente. No forma parte del contrato de datos. |
+| `sync.lock`, `verify.lock` | Lock files | Exclusión mutua entre procesos. No contienen estado lógico. |
+
+### `index.json`
+
+Este es el estado principal. Se crea automáticamente si no existe y se reescribe de forma atómica usando un archivo temporal y `replace()`.
+
+Estructura de primer nivel:
+
+```json
+{
+  "created_at": "2026-06-22T00:00:00Z",
+  "config": {
+    "data_dir": "/datos",
+    "state_dir": "/state",
+    "github_accounts": [
+      { "account_id": "account_1", "owner": "tuusuario" }
+    ],
+    "branch": "main",
+    "uploads_prefix": "storage",
+    "repository_prefix": "data",
+    "repository_private": true,
+    "repository_max_size_kb": 524288,
+    "daily_upload_limit_gb": 5,
+    "web_host": "0.0.0.0",
+    "web_port": 8080,
+    "sync_interval_seconds": 604800,
+    "verify_interval_seconds": 604800,
+    "chunk_size_mb": 24,
+    "upload_sleep_min_seconds": 0,
+    "upload_sleep_max_seconds": 0
+  },
+  "tasks": {
+    "sync": {},
+    "verify": {}
+  },
+  "files": {},
+  "github_accounts": {}
+}
+```
+
+Notas importantes:
+
+- `config` es una instantánea de la configuración efectiva cargada al arrancar. Sirve para auditar qué valores quedaron activos en esa instancia.
+- `created_at` marca el instante en que el estado fue creado por primera vez.
+- `tasks` siempre contiene, como mínimo, `sync` y `verify`.
+- `files` es un mapa indexado por `file_id` estable.
+- `github_accounts` es un mapa indexado por `account_id`.
+
+#### `tasks.sync` y `tasks.verify`
+
+Cada tarea persistida contiene exactamente estos campos:
+
+- `last_started_at`
+- `last_finished_at`
+- `last_result` (`never`, `success` o `error`)
+- `last_error`
+- `last_summary`
+- `last_manual_trigger_at`
+- `running`
+
+`running` se refresca también en lectura para reflejar si el lock de proceso está tomado en ese momento.
+
+#### `files`
+
+Cada entrada de `files` representa un archivo local observado bajo `APP_DATA_DIR`.
+La clave del mapa es `file_id`, calculado de forma estable a partir de la ruta relativa.
+
+Campos de la entrada de archivo:
+
+- `file_id`
+- `path`
+- `present`
+- `size`
+- `mtime_ns`
+- `source_sha256`
+- `last_seen_at`
+- `versions`
+- `active_version_id`
+- `last_verification`
+- `last_error`
+
+Qué significa cada uno:
+
+- `path` guarda la ruta relativa dentro de `APP_DATA_DIR`.
+- `present` indica si el archivo sigue existiendo en el escaneo o en la verificación.
+- `size` y `mtime_ns` permiten una sincronización ligera sin volver a hashear si el archivo no cambió.
+- `source_sha256` es el hash del contenido en claro del archivo local.
+- `versions` es el historial de versiones subidas para ese archivo.
+- `active_version_id` apunta a la versión actualmente considerada vigente.
+- `last_verification` guarda el resultado de la última verificación de esa versión activa.
+- `last_error` almacena el último error conocido para ese archivo.
+
+Cada elemento de `versions` es un objeto completo de versión con, como mínimo:
+
+- `version_id`
+- `created_at`
+- `plaintext_sha256`
+- `ciphertext_sha256`
+- `size`
+- `mtime_ns`
+- `source_sha256`
+- `repository_owner`
+- `repository`
+- `branch`
+- `account_id`
+- `encryption`
+- `chunks`
+- `commit_sha`
+- `uploaded_bytes`
+
+El bloque `encryption` contiene:
+
+- `algorithm`
+- `nonce_b64`
+- `key_id`
+
+El bloque `chunks` contiene una lista de fragmentos con:
+
+- `index`
+- `path`
+- `raw_url`
+- `sha256`
+- `size`
+- `repository`
+- `repository_owner`
+- `account_id`
+
+#### `github_accounts`
+
+Cada cuenta GitHub mantiene su propio subestado:
+
+- `account_id`
+- `owner`
+- `repositories`
+- `daily_uploads`
+- `last_metadata_refresh_at`
+- `last_upload_at`
+- `available`
+- `unavailable_reason`
+- `unavailable_since`
+- `alerts`
+
+Dentro de `repositories`, cada repositorio conocido guarda:
+
+- `name`
+- `owner`
+- `last_known_size_kb`
+- `private`
+- `last_refreshed_at`
+
+#### Reglas de evolución del JSON
+
+- Si `index.json` no existe, se crea con la estructura mínima por defecto.
+- Si faltan claves nuevas al cargar una versión vieja, el sistema las rellena con valores por defecto sin romper el resto del estado.
+- El estado se va guardando durante `sync` cada cierto número de archivos para no perder progreso intermedio.
+- `verify` solo actualiza los campos de verificación y errores, sin reescribir la historia completa de versiones.
+
+### `secrets.json`
+
+Este archivo contiene secretos de ejecución persistidos. Se escribe automáticamente durante el arranque si faltan valores.
+
+Campos actuales:
+
+- `web_pin`
+- `encryption_key`
+- `flask_secret_key`
+- `updated_at`
+
+Comportamiento:
+
+- Si `APP_WEB_PIN` está vacío y `secrets.json` no lo tiene, se genera un PIN numérico de 8 dígitos.
+- Si `APP_ENCRYPTION_KEY` está vacío y `secrets.json` no lo tiene, se genera una clave AES-256 compatible con `urlsafe_b64decode`.
+- `flask_secret_key` siempre se genera y se persiste si no existe.
+- Si ya hay valores en `secrets.json`, esos valores se reutilizan y no se sobrescriben salvo que el entorno fuerce uno explícito para `web_pin` o `encryption_key`.
+
+### `upload_index.sqlite3`
+
+La base SQLite guarda un índice de deduplicación por hash de contenido original.
+No almacena el árbol completo de estado, solo referencias a versiones ya vistas.
+
+Esquema actual:
+
+```sql
+CREATE TABLE IF NOT EXISTS uploaded_versions (
+    source_sha256 TEXT PRIMARY KEY,
+    version_json TEXT NOT NULL,
+    first_uploaded_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    copy_count INTEGER NOT NULL DEFAULT 1
+)
+```
+
+Uso real:
+
+- `source_sha256` identifica de forma única el contenido fuente.
+- `version_json` guarda la versión completa tal y como fue subida.
+- `first_uploaded_at` registra la primera vez que se vio esa versión.
+- `last_seen_at` se actualiza cuando el mismo hash vuelve a aparecer.
+- `copy_count` se incrementa cuando otra copia local del mismo contenido reutiliza esa versión.
+
+La conexión SQLite se abre con `WAL` y `synchronous=NORMAL`.
+Cuando un archivo local vuelve a aparecer con el mismo `source_sha256`, el sistema intenta reutilizar la versión ya registrada en esta tabla antes de subir de nuevo.
+
+### Variables de entorno
+
+El runtime carga primero `.env` y solo rellena variables que no existan ya en el entorno del proceso.
+También acepta líneas con `export VAR=valor`, ignora comentarios y soporta valores entre comillas.
 
 ```bash
 cp .env.example .env
 ```
 
-### Configuración común
+#### Variables de aplicación
 
-```env
-APP_DATA_DIR=/datos
-APP_STATE_DIR=/state
-APP_WEB_HOST=0.0.0.0
-APP_WEB_PORT=8080
-APP_WEB_PIN=                  # Se genera automáticamente si no existe
-APP_ENCRYPTION_KEY=           # Se genera automáticamente si no existe
+| Variable | Requerida | Valor por defecto | Efecto |
+| --- | --- | --- | --- |
+| `APP_DATA_DIR` | No | `/datos` | Directorio de entrada de archivos a vigilar y sincronizar. |
+| `APP_STATE_DIR` | No | `/state` | Directorio donde vive todo el estado persistente. |
+| `APP_WEB_HOST` | No | `0.0.0.0` | Host de escucha de la interfaz web. |
+| `APP_WEB_PORT` | No | `8080` | Puerto de la interfaz web. |
+| `APP_SYNC_INTERVAL_SECONDS` | No | `604800` | Intervalo del scheduler de sync. |
+| `APP_VERIFY_INTERVAL_SECONDS` | No | `604800` | Intervalo del scheduler de verify. |
+| `APP_WEB_PIN` | No | generado si falta | PIN de acceso a la web. Se persiste en `secrets.json` si no se define. |
+| `APP_ENCRYPTION_KEY` | No | generada si falta | Clave de cifrado AES-256-GCM. Se persiste en `secrets.json` si no se define. |
 
-APP_SYNC_INTERVAL_SECONDS=604800
-APP_VERIFY_INTERVAL_SECONDS=604800
-```
+#### Variables GitHub por cuenta
 
-### Backend GitHub
+| Variable | Requerida | Valor por defecto | Efecto |
+| --- | --- | --- | --- |
+| `GITHUB_ACCOUNT_<n>_TOKEN` | Sí, junto con `OWNER` | - | Token de acceso de la cuenta. |
+| `GITHUB_ACCOUNT_<n>_OWNER` | Sí, junto con `TOKEN` | - | Usuario u organización propietaria. |
+| `GITHUB_TOKEN` | Solo modo legado | - | Token único heredado. Se usa solo si no hay cuentas numeradas. |
+| `GITHUB_REPOSITORY` | Solo modo legado | - | Repositorio heredado `owner/repo`. Se usa solo si no hay cuentas numeradas. |
 
-```env
-# Cuentas (puedes tener tantas como quieras)
-GITHUB_ACCOUNT_1_TOKEN=ghp_xxxxxxxxxxxxxxxx
-GITHUB_ACCOUNT_1_OWNER=tuusuario
-GITHUB_ACCOUNT_2_TOKEN=ghp_yyyyyyyyyyyyyyyyyyyy
-GITHUB_ACCOUNT_2_OWNER=tuorg
+Reglas de descubrimiento:
 
-GITHUB_BRANCH=main
-GITHUB_REPOSITORY_PREFIX=spider-back
-GITHUB_REPOSITORY_PRIVATE=true
-GITHUB_REPOSITORY_MAX_SIZE_KB=524288
-GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB=5
-GITHUB_CHUNK_SIZE_MB=24
-```
+- Se pueden definir tantas cuentas numeradas como quieras.
+- Si existe al menos una cuenta numerada, el modo legado (`GITHUB_TOKEN` + `GITHUB_REPOSITORY`) se ignora.
+- Si una cuenta numerada tiene `TOKEN` pero no `OWNER`, o al revés, la carga de configuración falla.
 
-### Backend Telegram
+#### Variables GitHub de almacenamiento
 
-```env
-# Obtenidas en https://my.telegram.org
-TELEGRAM_API_ID=1234567
-TELEGRAM_API_HASH=abcdef0123456789abcdef0123456789
+| Variable | Requerida | Valor por defecto efectivo | Efecto |
+| --- | --- | --- | --- |
+| `GITHUB_BRANCH` | No | `main` | Rama destino para los blobs y commits. |
+| `GITHUB_UPLOADS_PREFIX` | No | `storage` | Prefijo remoto donde se guardan los objetos subidos. |
+| `GITHUB_REPOSITORY_PREFIX` | No | `data` | Prefijo de repositorios gestionados. El valor se normaliza quitando guiones finales. |
+| `GITHUB_REPOSITORY_PRIVATE` | No | `true` | Crea repositorios privados por defecto. |
+| `GITHUB_REPOSITORY_MAX_SIZE_KB` | Sí | - | Límite máximo de tamaño por repositorio gestionado. |
+| `GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB` | Sí | - | Límite diario de subida por cuenta. |
+| `GITHUB_CHUNK_SIZE_MB` | No | `24` | Tamaño nominal de fragmentación. El código lo recorta a un máximo efectivo de `95 MB`. |
+| `GITHUB_TIMEOUT_SECONDS` | No | `300` | Timeout de peticiones GitHub. |
+| `GITHUB_MAX_RETRY` | No | `3` | Número de reintentos HTTP. |
+| `GITHUB_BACKOFF_SECONDS` | No | `2` | Retardo base entre reintentos. |
+| `GITHUB_UPLOAD_SLEEP_MIN_SECONDS` | No | `0` | Límite inferior del sleep entre subidas. |
+| `GITHUB_UPLOAD_SLEEP_MAX_SECONDS` | No | `0` | Límite superior del sleep entre subidas. Debe ser mayor o igual que el mínimo. |
 
-# Canales privados (IDs suelen empezar por -100)
-TELEGRAM_CHANNEL_1_ID=-1001234567890
-TELEGRAM_CHANNEL_2_ID=-1000987654321
+Notas de compatibilidad:
 
-TELEGRAM_MAX_FILE_SIZE_MB=2000
-TELEGRAM_CHANNEL_DAILY_UPLOAD_LIMIT_GB=50
-TELEGRAM_CHUNK_SIZE_MB=24
-```
+- `.env.example` incluye valores de ejemplo más conservadores para `GITHUB_UPLOAD_SLEEP_MIN_SECONDS` y `GITHUB_UPLOAD_SLEEP_MAX_SECONDS`; si no se definen, el runtime no duerme entre subidas.
+- `GITHUB_REPOSITORY_PREFIX` se limpia con `strip("-")`, así que `data`, `data-` y `data--` terminan normalizándose al mismo prefijo efectivo.
+- `GITHUB_CHUNK_SIZE_MB` se interpreta en bytes al generar chunks, pero el tamaño efectivo nunca supera 95 MB por chunk.
+
+#### Variables no implementadas en esta rama
+
+- En este árbol no aparecen variables `TELEGRAM_*` en el runtime ni en los tests.
+- Si la versión de producción que quieres comparar usa Telegram, conviene documentar esas variables en un bloque separado para no mezclar contratos distintos.
 
 ## Docker
 
 ```bash
 # Construir e iniciar
 docker compose up -d --build
-
-# Primera vez con Telegram (login)
-docker compose run --rm app python3 -m spider_back.main telegram-login
 ```
 
 Si no definiste `APP_WEB_PIN`, revisa los logs:
@@ -105,7 +328,7 @@ Accede a `http://tu-servidor:8080`
 - `/` → Dashboard (últimas ejecuciones, cuotas, estado)
 - `/files` → Listado de archivos y versiones
 - `/logs` → Logs persistentes
-- Acciones manuales: Sync, Sync-by-name, Full Sync, Verify
+- Acciones manuales: Sync, Full Sync, Verify
 
 ## Comandos (desarrollo y mantenimiento)
 
@@ -128,15 +351,15 @@ python3 -m spider_back.main run-once-verify
 ## Estructura de almacenamiento
 
 - **GitHub**: Repositorios automáticos (`spider-back-0001`, `spider-back-0002`, …) con chunks en el branch configurado.
-- **Telegram**: Mensajes en canales privados con `message_id` y `file_id`.
-
-Todo el historial de versiones se guarda en `/state/index.json`.
+- **`/state/index.json`**: historial completo de archivos, versiones y cuentas.
+- **`/state/secrets.json`**: PIN web, clave de cifrado y secreto Flask persistidos.
+- **`/state/upload_index.sqlite3`**: índice de versiones ya subidas y reutilizadas.
 
 ## Seguridad
 
 - La aplicación nunca descifra el contenido local (solo compara bytes cifrados).
-- Clave de cifrado generada automáticamente y guardada en `/state/secrets.json`.
-- Tokens y sesiones de Telegram se guardan en el volumen persistente `/state`.
+- La clave de cifrado y el PIN web se generan automáticamente si no se definen y se guardan en `/state/secrets.json`.
+- El índice SQLite evita subir de nuevo contenido ya visto con el mismo `source_sha256`.
 
 ## Recomendaciones
 
