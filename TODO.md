@@ -1,6 +1,3 @@
-- Asegurar que la migracion mantienen el estado correctamente.
-- GITHUB_COPY_COUNT debería de ser COPY_COUNT ya que se refiere a copias del archivo en cuentas de cualquier red, no solo github (ej de redes: github, telegram, mega, etc ...)
-- Se debe de mostrar en la web un porcentaje de los archivos totales con 1 o mas copias, otro porcentaje con 2 o mas copias, ... asi hasta COPY_COUNT.
-- _is_file_already_synced debe considerarse sincronizado si ya se han realizado el total de copias (COPY_COUNT).
-- Se ha de tener en cuenta que dos copias bajo una misma cuenta se considera una sola cuenta.
-- Se ha de revisar que toda la aplicación soporte múltiples redes, pues estamos migrando de una versión que estaba enfocada solo en github.
+- La migración de estado debe ser automática: detecta si el estado actual requiere agregar algun campo y lo rellena (sanitiza el estado de la aplicación)
+- Implementar telegram_api.py (basado en telegram.py.md)
+- Revisar detenidamente si la implementacion de _sync_impl y _verify_impl en service.py es correcta.

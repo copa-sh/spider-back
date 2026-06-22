@@ -244,11 +244,15 @@ class AppService:
         LOGGER.info("sync escaneando directorio=%s modo=%s", self.config.app_data_dir, "full" if full else "light")
         files_state = state["files"]
         discovered_paths: set[str] = set()
-        pending_files: list[dict[str, Any]] = []
+        
         scanned_files = 0
         unchanged_files = 0
-        last_scan_log_at = time.monotonic()
         synced_or_reused_files = 0
+        uploaded_files = 0
+        failed_files = 0
+        uploaded_bytes = 0
+        last_scan_log_at = time.monotonic()
+        processed_since_flush = 0
 
         for file_path in iter_files(self.config.app_data_dir):
             rel_path = rel_path_str(self.config.app_data_dir, file_path)
@@ -261,267 +265,74 @@ class AppService:
 
             entry = files_state.get(file_id)
             active_version = self._get_active_version(entry) if entry else None
+            
+            # 1. Sin cambios
             if self._is_file_already_synced(entry, active_version, size, mtime_ns, full=full):
                 entry["size"] = size
                 entry["mtime_ns"] = mtime_ns
                 entry["present"] = True
                 entry["last_seen_at"] = utc_now_iso()
                 unchanged_files += 1
-                if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
-                    LOGGER.info(
-                        "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
-                        scanned_files,
-                        len(pending_files),
-                        unchanged_files,
-                        rel_path,
-                    )
-                    last_scan_log_at = time.monotonic()
+                self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
                 continue
 
             source_sha256 = sha256_file(file_path)
+            
+            # 2. Mismo hash, pero replicación incompleta (reanudar)
             if active_version and active_version.get("plaintext_sha256") == source_sha256 and entry.get("present"):
-                entry["size"] = size
-                entry["mtime_ns"] = mtime_ns
-                entry["source_sha256"] = source_sha256
-                entry["present"] = True
-                entry["last_seen_at"] = utc_now_iso()
+                entry.update({"size": size, "mtime_ns": mtime_ns, "source_sha256": source_sha256, "present": True, "last_seen_at": utc_now_iso()})
+                
                 if active_version.get("replication_complete", True):
                     unchanged_files += 1
-                    if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
-                        LOGGER.info(
-                            "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
-                            scanned_files,
-                            len(pending_files),
-                            unchanged_files,
-                            rel_path,
-                        )
-                        last_scan_log_at = time.monotonic()
+                    self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
                     continue
 
-                pending_files.append(
-                    {
-                        "file_id": file_id,
-                        "file_path": file_path,
-                        "rel_path": rel_path,
-                        "size": size,
-                        "mtime_ns": mtime_ns,
-                        "source_sha256": source_sha256,
-                        "resume_version": active_version,
-                    }
+                # Subida inmediata
+                uploaded_files, failed_files, uploaded_bytes, processed_since_flush = self._process_upload(
+                    state, files_state, file_id, file_path, rel_path, size, mtime_ns, source_sha256, active_version,
+                    uploaded_files, failed_files, uploaded_bytes, processed_since_flush
                 )
-                if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
-                    LOGGER.info(
-                        "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
-                        scanned_files,
-                        len(pending_files),
-                        unchanged_files,
-                        rel_path,
-                    )
-                    last_scan_log_at = time.monotonic()
+                self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
                 continue
 
+            # 3. Hash ya existe en otro lado (reutilizar)
             existing_version = self._lookup_uploaded_version(source_sha256)
             if existing_version is not None:
                 existing_version = self._normalize_version(existing_version)
                 if not existing_version.get("replication_complete", True):
-                    pending_files.append(
-                        {
-                            "file_id": file_id,
-                            "file_path": file_path,
-                            "rel_path": rel_path,
-                            "size": size,
-                            "mtime_ns": mtime_ns,
-                            "source_sha256": source_sha256,
-                            "resume_version": existing_version,
-                        }
+                    # Subida inmediata para completar
+                    uploaded_files, failed_files, uploaded_bytes, processed_since_flush = self._process_upload(
+                        state, files_state, file_id, file_path, rel_path, size, mtime_ns, source_sha256, existing_version,
+                        uploaded_files, failed_files, uploaded_bytes, processed_since_flush
                     )
-                    if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
-                        LOGGER.info(
-                            "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
-                            scanned_files,
-                            len(pending_files),
-                            unchanged_files + synced_or_reused_files,
-                            rel_path,
-                        )
-                        last_scan_log_at = time.monotonic()
+                    self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
                     continue
-                entry = files_state.setdefault(
-                    file_id,
-                    {
-                        "file_id": file_id,
-                        "path": rel_path,
-                        "versions": [],
-                        "active_version_id": None,
-                        "last_verification": None,
-                        "last_error": None,
-                    },
-                )
-                self._apply_existing_version_entry(
-                    entry,
-                    rel_path=rel_path,
-                    size=size,
-                    mtime_ns=mtime_ns,
-                    source_sha256=source_sha256,
-                    version=existing_version,
-                )
+                    
+                entry = files_state.setdefault(file_id, {"file_id": file_id, "path": rel_path, "versions": [], "active_version_id": None, "last_verification": None, "last_error": None})
+                self._apply_existing_version_entry(entry, rel_path=rel_path, size=size, mtime_ns=mtime_ns, source_sha256=source_sha256, version=existing_version)
                 if existing_version.get("replication_complete", True):
                     self._mark_uploaded_copy_seen(source_sha256)
                 synced_or_reused_files += 1
-                if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
-                    LOGGER.info(
-                        "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
-                        scanned_files,
-                        len(pending_files),
-                        unchanged_files + synced_or_reused_files,
-                        rel_path,
-                    )
-                    last_scan_log_at = time.monotonic()
+                self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
                 continue
 
-            pending_files.append(
-                {
-                    "file_id": file_id,
-                    "file_path": file_path,
-                    "rel_path": rel_path,
-                    "size": size,
-                    "mtime_ns": mtime_ns,
-                    "source_sha256": source_sha256,
-                    "resume_version": None,
-                }
+            # 4. Archivo completamente nuevo (Subida inmediata)
+            uploaded_files, failed_files, uploaded_bytes, processed_since_flush = self._process_upload(
+                state, files_state, file_id, file_path, rel_path, size, mtime_ns, source_sha256, None,
+                uploaded_files, failed_files, uploaded_bytes, processed_since_flush
             )
-            if scanned_files == 1 or scanned_files % 100 == 0 or time.monotonic() - last_scan_log_at >= 10:
-                LOGGER.info(
-                    "sync escaneo progreso: revisados=%s pendientes=%s sin_cambios=%s ultimo=%s",
-                    scanned_files,
-                    len(pending_files),
-                    unchanged_files,
-                    rel_path,
-                )
-                last_scan_log_at = time.monotonic()
+            self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
 
-        LOGGER.info(
-            "sync analizado: %s archivos detectados, %s pendientes de subida, %s ya estaban al dia.",
-            len(discovered_paths),
-            len(pending_files),
-            unchanged_files + synced_or_reused_files,
-        )
-
+        # Esto se ejecuta solo si el escaneo termina con éxito
+        LOGGER.info("sync analizado: %s archivos detectados, %s subidos/reutilizados, %s sin cambios.", len(discovered_paths), uploaded_files + synced_or_reused_files, unchanged_files)
+        
+        # Marcado de archivos eliminados (ahora es seguro porque terminamos de escanear)
         for entry in files_state.values():
             if entry["path"] not in discovered_paths:
                 entry["present"] = False
                 entry["last_seen_at"] = utc_now_iso()
 
-        uploaded_files = 0
-        failed_files = 0
-        uploaded_bytes = 0
-
-        processed_since_flush = 0
-        for item in pending_files:
-            file_id = item["file_id"]
-            file_path = item["file_path"]
-            rel_path = item["rel_path"]
-            size = item["size"]
-            mtime_ns = item["mtime_ns"]
-            source_sha256 = item["source_sha256"]
-            resume_version = item.get("resume_version")
-            entry = files_state.setdefault(
-                file_id,
-                {
-                    "file_id": file_id,
-                    "path": rel_path,
-                    "versions": [],
-                    "active_version_id": None,
-                    "last_verification": None,
-                    "last_error": None,
-                },
-            )
-            try:
-                LOGGER.info(
-                    "sync %sarchivo path=%s size=%sB",
-                    "completando " if resume_version else "subiendo ",
-                    rel_path,
-                    size,
-                )
-                version = self._upload_file_version(
-                    state,
-                    file_id,
-                    file_path,
-                    rel_path,
-                    size,
-                    mtime_ns,
-                    source_sha256,
-                    resume_version=resume_version,
-                )
-                entry["path"] = rel_path
-                entry["present"] = True
-                entry["size"] = size
-                entry["mtime_ns"] = mtime_ns
-                entry["source_sha256"] = source_sha256
-                entry["last_seen_at"] = utc_now_iso()
-                existing_versions = entry.setdefault("versions", [])
-                existing_index = next((idx for idx, item in enumerate(existing_versions) if item.get("version_id") == version["version_id"]), None)
-                if existing_index is None:
-                    existing_versions.append(version)
-                else:
-                    existing_versions[existing_index] = version
-                entry["active_version_id"] = version["version_id"]
-                # New version supersedes any prior verification — the stored
-                # last_verification was for the previous active version.
-                entry["last_verification"] = None
-                if version.get("replication_complete", True):
-                    entry["last_error"] = None
-                    uploaded_files += 1
-                else:
-                    entry["last_error"] = (
-                        version.get("copy_errors", [{}])[-1].get("error")
-                        if version.get("copy_errors")
-                        else "La version no se pudo replicar completamente."
-                    )
-                    failed_files += 1
-                uploaded_bytes += version["uploaded_bytes"]
-                if version.get("replication_complete", True):
-                    self._record_uploaded_version(source_sha256, version)
-                LOGGER.info(
-                    "sync archivo %s path=%s cuenta=%s repo=%s version=%s bytes=%s",
-                    "replicado" if version.get("replication_complete", True) else "parcial",
-                    rel_path,
-                    version["account_id"],
-                    version["repository"],
-                    version["version_id"],
-                    version["uploaded_bytes"],
-                )
-            except NoAvailableAccountsError as exc:
-                # No GitHub accounts have available daily quota: stop the sync task.
-                entry["last_error"] = str(exc)
-                self.state_manager.save(state)
-                summary = {
-                    "scanned_files": len(discovered_paths),
-                    "uploaded_files": uploaded_files,
-                    "reused_files": synced_or_reused_files,
-                    "failed_files": failed_files,
-                    "uploaded_bytes": uploaded_bytes,
-                    "missing_files": sum(1 for entry in files_state.values() if not entry.get("present")),
-                }
-                LOGGER.warning("sync detenido: %s", exc)
-                return TaskResult(False, summary, str(exc))
-            except Exception as exc:
-                entry["path"] = rel_path
-                entry["present"] = True
-                entry["size"] = size
-                entry["mtime_ns"] = mtime_ns
-                entry["source_sha256"] = source_sha256
-                entry["last_seen_at"] = utc_now_iso()
-                entry["last_error"] = str(exc)
-                failed_files += 1
-                LOGGER.exception("sync error subiendo path=%s", rel_path)
-
-            # cada N archivos, volcar el state actual a disco para no perder progreso
-            processed_since_flush += 1
-            if processed_since_flush >= self._state_flush_every:
-                self.state_manager.save(state)
-                processed_since_flush = 0
-
-        self.state_manager.save(state)
+        self.state_manager.save(state) # Guardado final
         summary = {
             "scanned_files": len(discovered_paths),
             "uploaded_files": uploaded_files,
@@ -531,7 +342,56 @@ class AppService:
             "missing_files": sum(1 for entry in files_state.values() if not entry.get("present")),
         }
         return TaskResult(failed_files == 0, summary, None if failed_files == 0 else f"{failed_files} archivos con error")
+    
+    def _log_scan_progress(self, scanned, failed, ok, path, last_log_time):
+        if scanned == 1 or scanned % 100 == 0 or time.monotonic() - last_log_time >= 10:
+            LOGGER.info("sync progreso: revisados=%s errores=%s al_dia=%s ultimo=%s", scanned, failed, ok, path)
+            last_log_time = time.monotonic()
+        return last_log_time
 
+    def _process_upload(self, state, files_state, file_id, file_path, rel_path, size, mtime_ns, source_sha256, resume_version, up_files, fail_files, up_bytes, flush_count):
+        entry = files_state.setdefault(file_id, {"file_id": file_id, "path": rel_path, "versions": [], "active_version_id": None, "last_verification": None, "last_error": None})
+        try:
+            LOGGER.info("sync %sarchivo path=%s size=%sB", "completando " if resume_version else "subiendo ", rel_path, size)
+            version = self._upload_file_version(state, file_id, file_path, rel_path, size, mtime_ns, source_sha256, resume_version=resume_version)
+            
+            entry.update({"path": rel_path, "present": True, "size": size, "mtime_ns": mtime_ns, "source_sha256": source_sha256, "last_seen_at": utc_now_iso()})
+            existing_versions = entry.setdefault("versions", [])
+            existing_index = next((idx for idx, item in enumerate(existing_versions) if item.get("version_id") == version["version_id"]), None)
+            if existing_index is None:
+                existing_versions.append(version)
+            else:
+                existing_versions[existing_index] = version
+            entry["active_version_id"] = version["version_id"]
+            entry["last_verification"] = None
+            
+            if version.get("replication_complete", True):
+                entry["last_error"] = None
+                up_files += 1
+                self._record_uploaded_version(source_sha256, version)
+            else:
+                entry["last_error"] = version.get("copy_errors", [{}])[-1].get("error") if version.get("copy_errors") else "La version no se pudo replicar completamente."
+                fail_files += 1
+                
+            up_bytes += version["uploaded_bytes"]
+            LOGGER.info("sync archivo %s path=%s cuenta=%s repo=%s version=%s bytes=%s", "replicado" if version.get("replication_complete") else "parcial", rel_path, version["account_id"], version["repository"], version["version_id"], version["uploaded_bytes"])
+
+        except NoAvailableAccountsError as exc:
+            entry["last_error"] = str(exc)
+            self.state_manager.save(state)
+            raise  # Relanzamos para que el bucle principal lo capture y devuelva el TaskResult(False)
+        except Exception as exc:
+            entry.update({"path": rel_path, "present": True, "size": size, "mtime_ns": mtime_ns, "source_sha256": source_sha256, "last_seen_at": utc_now_iso(), "last_error": str(exc)})
+            fail_files += 1
+            LOGGER.exception("sync error subiendo path=%s", rel_path)
+
+        flush_count += 1
+        if flush_count >= self._state_flush_every:
+            self.state_manager.save(state)
+            flush_count = 0
+
+        return up_files, fail_files, up_bytes, flush_count
+    
     def _verify_impl(self, state: dict[str, Any]) -> TaskResult:
         self._ensure_github_accounts_state(state)
         files_state = state["files"]
