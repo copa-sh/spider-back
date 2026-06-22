@@ -106,6 +106,15 @@ class GitHubAccountConfig:
 
 
 @dataclass(frozen=True)
+class TelegramAccountConfig:
+    account_id: str
+    api_id: int
+    api_hash: str
+    phone: str
+    network: str = "telegram"
+
+
+@dataclass(frozen=True)
 class AppConfig:
     github_accounts: tuple[GitHubAccountConfig, ...]
     github_branch: str
@@ -131,6 +140,12 @@ class AppConfig:
     app_verify_interval_seconds: int
     app_web_pin: str | None
     app_encryption_key: str | None
+    telegram_accounts: tuple[TelegramAccountConfig, ...] = ()
+    tg_channel_prefix: str = "spider-model"
+    tg_channel_private: bool = True
+    tg_timeout_seconds: int = 900
+    tg_max_retry: int = DEFAULT_MAX_RETRY
+    tg_backoff_seconds: int = DEFAULT_BACKOFF_SECONDS
 
     @property
     def github_chunk_size_bytes(self) -> int:
@@ -150,6 +165,39 @@ class RuntimeSecrets:
     def encryption_key_bytes(self) -> bytes:
         padding = "=" * (-len(self.encryption_key) % 4)
         return base64.urlsafe_b64decode(self.encryption_key + padding)
+
+
+def _discover_telegram_accounts() -> tuple[TelegramAccountConfig, ...]:
+    accounts: list[TelegramAccountConfig] = []
+    indices: set[str] = set()
+    pattern = re.compile(r"^TG_ACCOUNT_(\d+)_(API_ID|API_HASH|PHONE)$")
+    for key in os.environ:
+        match = pattern.match(key)
+        if match:
+            indices.add(match.group(1))
+
+    for index in sorted(indices, key=int):
+        api_id_str = os.environ.get(f"TG_ACCOUNT_{index}_API_ID", "").strip()
+        api_hash = os.environ.get(f"TG_ACCOUNT_{index}_API_HASH", "").strip()
+        phone = os.environ.get(f"TG_ACCOUNT_{index}_PHONE", "").strip()
+        present = [bool(api_id_str), bool(api_hash), bool(phone)]
+        if all(present):
+            try:
+                api_id = int(api_id_str)
+            except ValueError as exc:
+                raise ConfigError(f"TG_ACCOUNT_{index}_API_ID debe ser un entero.") from exc
+            accounts.append(TelegramAccountConfig(
+                account_id=f"tg_account_{index}",
+                api_id=api_id,
+                api_hash=api_hash,
+                phone=phone,
+            ))
+        elif any(present):
+            raise ConfigError(
+                f"La cuenta Telegram {index} debe definir TG_ACCOUNT_{index}_API_ID, API_HASH y PHONE."
+            )
+
+    return tuple(accounts)
 
 
 def _discover_accounts() -> tuple[GitHubAccountConfig, ...]:
@@ -211,10 +259,19 @@ def load_config() -> AppConfig:
         raise ConfigError("GITHUB_UPLOAD_SLEEP_MIN_SECONDS no puede ser mayor que GITHUB_UPLOAD_SLEEP_MAX_SECONDS.")
 
     github_accounts = _discover_accounts()
+    telegram_accounts = _discover_telegram_accounts()
+    tg_channel_prefix = (
+        os.environ.get("TG_CHANNEL_PREFIX", "spider-model").strip().strip("-")
+        or "spider-model"
+    )
+    tg_channel_private = _env_bool("TG_CHANNEL_PRIVATE", True)
+    tg_timeout_seconds = _env_int("TG_TIMEOUT_SECONDS", 900)
+    tg_max_retry = _env_int("TG_MAX_RETRY", DEFAULT_MAX_RETRY)
+    tg_backoff_seconds = _env_int("TG_BACKOFF_SECONDS", DEFAULT_BACKOFF_SECONDS)
+
     # A copy is placed on a distinct account, so COPY_COUNT can never exceed the
-    # number of configured accounts across every network. GitHub is the only
-    # network with config-level accounts today; other networks add to this total.
-    total_accounts = len(github_accounts)
+    # number of configured accounts across every network.
+    total_accounts = len(github_accounts) + len(telegram_accounts)
     if copy_count > total_accounts:
         raise ConfigError("COPY_COUNT no puede ser mayor que el numero de cuentas configuradas (todas las redes).")
 
@@ -241,6 +298,12 @@ def load_config() -> AppConfig:
         app_verify_interval_seconds=_env_int("APP_VERIFY_INTERVAL_SECONDS", DEFAULT_INTERVAL_SECONDS),
         app_web_pin=os.environ.get("APP_WEB_PIN", "").strip() or None,
         app_encryption_key=os.environ.get("APP_ENCRYPTION_KEY", "").strip() or None,
+        telegram_accounts=telegram_accounts,
+        tg_channel_prefix=tg_channel_prefix,
+        tg_channel_private=tg_channel_private,
+        tg_timeout_seconds=tg_timeout_seconds,
+        tg_max_retry=tg_max_retry,
+        tg_backoff_seconds=tg_backoff_seconds,
     )
 
     config.app_state_dir.mkdir(parents=True, exist_ok=True)
