@@ -55,3 +55,31 @@ def test_load_config_requires_complete_account(tmp_path):
     with patch.dict("os.environ", env, clear=True):
         with pytest.raises(ConfigError):
             load_config()
+
+
+def test_copy_count_reads_network_agnostic_env(tmp_path):
+    env = _base_env(tmp_path)
+    env["GITHUB_ACCOUNT_2_TOKEN"] = "token-2"
+    env["GITHUB_ACCOUNT_2_OWNER"] = "owner-2"
+    env["COPY_COUNT"] = "2"
+    with patch.dict("os.environ", env, clear=True):
+        config = load_config()
+    assert config.copy_count == 2
+
+
+def test_copy_count_falls_back_to_legacy_github_env(tmp_path):
+    env = _base_env(tmp_path)
+    env["GITHUB_ACCOUNT_2_TOKEN"] = "token-2"
+    env["GITHUB_ACCOUNT_2_OWNER"] = "owner-2"
+    env["GITHUB_COPY_COUNT"] = "2"  # legacy name still honored
+    with patch.dict("os.environ", env, clear=True):
+        config = load_config()
+    assert config.copy_count == 2
+
+
+def test_copy_count_cannot_exceed_account_total(tmp_path):
+    env = _base_env(tmp_path)
+    env["COPY_COUNT"] = "2"  # only one account configured
+    with patch.dict("os.environ", env, clear=True):
+        with pytest.raises(ConfigError):
+            load_config()

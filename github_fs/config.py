@@ -114,7 +114,9 @@ class AppConfig:
     github_repository_private: bool
     github_repository_max_size_kb: int
     github_account_daily_upload_limit_gb: float
-    github_copy_count: int
+    # Number of copies of each version, one per distinct account. Network-agnostic
+    # (a copy may live on GitHub, Telegram, etc.), hence no `github_` prefix.
+    copy_count: int
     github_chunk_size_mb: int
     github_timeout_seconds: int
     github_max_retry: int
@@ -197,15 +199,24 @@ def load_config() -> AppConfig:
     github_repository_private = _env_bool("GITHUB_REPOSITORY_PRIVATE", True)
     github_repository_max_size_kb = _env_int("GITHUB_REPOSITORY_MAX_SIZE_KB")
     github_account_daily_upload_limit_gb = _env_float("GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB")
-    github_copy_count = _env_int("GITHUB_COPY_COUNT", DEFAULT_COPY_COUNT)
+    # COPY_COUNT is the network-agnostic name. Fall back to the legacy
+    # GITHUB_COPY_COUNT so existing deployments keep working.
+    if os.environ.get("COPY_COUNT", "").strip():
+        copy_count = _env_int("COPY_COUNT", DEFAULT_COPY_COUNT)
+    else:
+        copy_count = _env_int("GITHUB_COPY_COUNT", DEFAULT_COPY_COUNT)
     github_upload_sleep_min_seconds = _env_float("GITHUB_UPLOAD_SLEEP_MIN_SECONDS", 0.0, allow_zero=True)
     github_upload_sleep_max_seconds = _env_float("GITHUB_UPLOAD_SLEEP_MAX_SECONDS", 0.0, allow_zero=True)
     if github_upload_sleep_min_seconds > github_upload_sleep_max_seconds:
         raise ConfigError("GITHUB_UPLOAD_SLEEP_MIN_SECONDS no puede ser mayor que GITHUB_UPLOAD_SLEEP_MAX_SECONDS.")
 
     github_accounts = _discover_accounts()
-    if github_copy_count > len(github_accounts):
-        raise ConfigError("GITHUB_COPY_COUNT no puede ser mayor que el numero de cuentas GitHub configuradas.")
+    # A copy is placed on a distinct account, so COPY_COUNT can never exceed the
+    # number of configured accounts across every network. GitHub is the only
+    # network with config-level accounts today; other networks add to this total.
+    total_accounts = len(github_accounts)
+    if copy_count > total_accounts:
+        raise ConfigError("COPY_COUNT no puede ser mayor que el numero de cuentas configuradas (todas las redes).")
 
     config = AppConfig(
         github_accounts=github_accounts,
@@ -215,7 +226,7 @@ def load_config() -> AppConfig:
         github_repository_private=github_repository_private,
         github_repository_max_size_kb=github_repository_max_size_kb,
         github_account_daily_upload_limit_gb=github_account_daily_upload_limit_gb,
-        github_copy_count=github_copy_count,
+        copy_count=copy_count,
         github_chunk_size_mb=_env_int("GITHUB_CHUNK_SIZE_MB", DEFAULT_CHUNK_SIZE_MB),
         github_timeout_seconds=_env_int("GITHUB_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
         github_max_retry=_env_int("GITHUB_MAX_RETRY", DEFAULT_MAX_RETRY),

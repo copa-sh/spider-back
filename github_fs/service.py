@@ -87,7 +87,7 @@ class AppService:
             "repository_private": config.github_repository_private,
             "repository_max_size_kb": config.github_repository_max_size_kb,
             "daily_upload_limit_gb": config.github_account_daily_upload_limit_gb,
-            "copy_count": config.github_copy_count,
+            "copy_count": config.copy_count,
             "web_host": config.app_web_host,
             "web_port": config.app_web_port,
             "sync_interval_seconds": config.app_sync_interval_seconds,
@@ -663,7 +663,35 @@ class AppService:
             return False
         if entry.get("mtime_ns") != mtime_ns:
             return False
+        # Only "synced" once the requested number of copies (COPY_COUNT) has been
+        # made. An under-replicated version must fall through so sync can add the
+        # remaining copies on the next pass.
+        if not self._is_version_replication_complete(active_version):
+            return False
         return True
+
+    @staticmethod
+    def distinct_account_copy_count(version: dict[str, Any] | None) -> int:
+        """Number of distinct accounts holding a copy of this version.
+
+        Two copies under the same account count as ONE — replication only buys
+        durability when copies live on different accounts/networks.
+        """
+        if not version:
+            return 0
+        seen: set[tuple[str, str]] = set()
+        for copy in version.get("copies", []):
+            account_id = copy.get("account_id")
+            if not account_id:
+                continue
+            seen.add((copy.get("network", "github"), account_id))
+        return len(seen)
+
+    def _is_version_replication_complete(self, version: dict[str, Any] | None) -> bool:
+        if not version:
+            return False
+        requested = int(version.get("copy_count_requested", self.config.copy_count))
+        return self.distinct_account_copy_count(version) >= requested
 
     @contextmanager
     def _upload_index_connection(self):
@@ -1009,7 +1037,7 @@ class AppService:
             encrypted = encrypt_bytes_with_nonce(plaintext, self.secrets.encryption_key_bytes(), nonce)
             version_id = base_version["version_id"]
             version_created_at = base_version.get("created_at", utc_now_iso())
-            copy_count = int(base_version.get("copy_count_requested", self.config.github_copy_count))
+            copy_count = int(base_version.get("copy_count_requested", self.config.copy_count))
             used_account_ids = {copy.get("account_id") for copy in base_version.get("copies", []) if copy.get("account_id")}
             copies: list[dict[str, Any]] = [deepcopy(copy) for copy in base_version.get("copies", [])]
             copy_errors = list(base_version.get("copy_errors", []))
@@ -1017,7 +1045,7 @@ class AppService:
             encrypted = encrypt_bytes(plaintext, self.secrets.encryption_key_bytes())
             version_id = utc_now_compact()
             version_created_at = utc_now_iso()
-            copy_count = self.config.github_copy_count
+            copy_count = self.config.copy_count
             used_account_ids = set()
             copies = []
             copy_errors = []
