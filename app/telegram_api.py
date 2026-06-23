@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
+
+LOGGER = logging.getLogger("spider-back")
 
 # Pyrogram is an optional dependency: the module must stay importable (and unit
 # testable with an injected fake client) on hosts that have not installed the
@@ -66,6 +69,19 @@ class UploadedChunkMeta:
     message_id: int            # ID del mensaje en el canal
     file_unique_id: str        # ID único e inmutable del archivo en Telegram
     size: int
+
+
+def _is_auth_key_unregistered(exc: Exception) -> bool:
+    """Whether ``exc`` is Telegram's revoked/unknown auth-key error (401).
+
+    Raised when the session's auth key is no longer valid — e.g. the session was
+    revoked, or regenerated out-of-band (web re-login, fresh ``.session`` mounted)
+    while this client still holds the stale key in memory. Matched by class name
+    and message so it works without importing ``pyrogram.errors``.
+    """
+    if type(exc).__name__ == "AuthKeyUnregistered":
+        return True
+    return "AUTH_KEY_UNREGISTERED" in str(exc).upper()
 
 
 def _flood_wait_seconds(exc: Exception) -> int | None:
@@ -141,6 +157,7 @@ class TelegramClient:
         Análogo a GitHubClient._request: acotado por settings.max_retry.
         """
         last_exc: Exception | None = None
+        auth_recovered = False
         for attempt in range(self.settings.max_retry):
             try:
                 self._ensure_connection()
@@ -164,6 +181,21 @@ class TelegramClient:
                 )
                 if is_flood and flood_seconds is not None:
                     self._sleeper(flood_seconds + 1)
+                    last_exc = exc
+                    continue
+                # Self-heal a revoked/stale auth key: the session may have been
+                # regenerated on disk (web re-login in another process, or a fresh
+                # .session mounted). Drop the cached client once and reconnect so
+                # the next attempt reloads the session from disk. Bounded: we only
+                # recover once per call, so a genuinely dead session still fails.
+                if not auth_recovered and _is_auth_key_unregistered(exc):
+                    auth_recovered = True
+                    LOGGER.warning(
+                        "sesión Telegram inválida en %s (auth key revocada); "
+                        "recargando sesión del disco y reintentando",
+                        action_name,
+                    )
+                    self.reset()
                     last_exc = exc
                     continue
                 raise TelegramError(f"Error en {action_name}: {exc}") from exc
