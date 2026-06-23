@@ -315,6 +315,17 @@ class TelegramClient:
             if callable(disconnect):
                 disconnect()
 
+    def reset(self) -> None:
+        """Descarta el cliente cacheado para que se reconstruya desde el .session.
+
+        Tras un re-login por la web, el fichero de sesión en disco cambia; el
+        cliente en memoria (posiblemente con una auth key revocada) debe
+        recrearse en la próxima operación para tomar la sesión nueva.
+        """
+        self.disconnect()
+        self._client = None
+        self._authenticated_user_id = None
+
 
 def _is_channel(chat: Any) -> bool:
     chat_type = getattr(chat, "type", None)

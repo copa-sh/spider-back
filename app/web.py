@@ -9,6 +9,8 @@ from flask import Flask, abort, redirect, render_template_string, request, sessi
 
 from .runtime import bootstrap_service
 from .service import AppService
+from .telegram_api import _PyrogramClient
+from .telegram_login import AUTHORIZED, LoginError, TelegramLoginManager
 from .utils import add_seconds_iso
 
 
@@ -58,8 +60,10 @@ HOME_TEMPLATE = """
           {{ account.account_id }} | phone={{ account.phone }} | api_id={{ account.api_id }} |
           pyrogram={{ "ok" if account.pyrogram_available else "NO INSTALADO" }} |
           disponible={{ "si" if account.available else "no" }} |
+          sesión={{ "presente" if account.has_session else "FALTA" }} |
           hoy={{ account.uploaded_today_bytes }} bytes
           {% if account.unavailable_reason %}| ⚠ {{ account.unavailable_reason }}{% endif %}
+          | <a href="{{ url_for('telegram_login', account_id=account.account_id) }}">{{ "re-autenticar" if account.has_session else "iniciar login" }}</a>
         </li>
         {% endfor %}
       </ul>
@@ -129,6 +133,50 @@ LOGIN_TEMPLATE = """
       <input id="pin" name="pin" type="password" autofocus>
       <button type="submit">Entrar</button>
     </form>
+  </body>
+</html>
+"""
+
+
+TELEGRAM_LOGIN_TEMPLATE = """
+<!doctype html>
+<html lang="es">
+  <body>
+    <h1>Login Telegram — {{ account_id }}</h1>
+    <p><a href="{{ url_for('home') }}">Volver</a></p>
+    <p><strong>Teléfono:</strong> {{ phone }}</p>
+    {% if error %}<p style="color:#b00;"><strong>{{ error }}</strong></p>{% endif %}
+    {% if notice %}<p style="color:#070;"><strong>{{ notice }}</strong></p>{% endif %}
+
+    {% if state == 'authorized' %}
+      <p>✅ Cuenta autenticada. La sesión <code>{{ account_id }}.session</code> está lista.</p>
+    {% elif state == 'code_sent' %}
+      <p>Telegram ha enviado un código a la app/SMS del número. Introdúcelo:</p>
+      <form method="post" action="{{ url_for('telegram_login_code', account_id=account_id) }}">
+        <input name="code" inputmode="numeric" autocomplete="one-time-code" autofocus placeholder="12345">
+        <button type="submit">Validar código</button>
+      </form>
+      <form method="post" action="{{ url_for('telegram_login_cancel', account_id=account_id) }}">
+        <button type="submit">Cancelar</button>
+      </form>
+    {% elif state == 'password_needed' %}
+      <p>La cuenta tiene verificación en dos pasos (2FA). Introduce la contraseña:</p>
+      <form method="post" action="{{ url_for('telegram_login_password', account_id=account_id) }}">
+        <input name="password" type="password" autofocus>
+        <button type="submit">Validar contraseña</button>
+      </form>
+      <form method="post" action="{{ url_for('telegram_login_cancel', account_id=account_id) }}">
+        <button type="submit">Cancelar</button>
+      </form>
+    {% else %}
+      <p>
+        {% if has_session %}Existe una sesión para esta cuenta.{% else %}No hay sesión para esta cuenta.{% endif %}
+        Al iniciar el login, la sesión anterior se aparta y se solicita un código nuevo a Telegram.
+      </p>
+      <form method="post" action="{{ url_for('telegram_login_start', account_id=account_id) }}">
+        <button type="submit">Iniciar login / Re-autenticar</button>
+      </form>
+    {% endif %}
   </body>
 </html>
 """
@@ -209,10 +257,54 @@ LOGS_TEMPLATE = """
 """
 
 
-def create_web_app(service: AppService) -> Flask:
+def _build_login_manager(service: AppService) -> TelegramLoginManager:
+    """Wire a TelegramLoginManager to the running service's accounts and clients."""
+
+    state_dir = service.config.app_state_dir
+
+    def client_factory(account_id: str):
+        if _PyrogramClient is None:
+            raise LoginError(
+                "Pyrogram no está instalado. Instala 'pyrogram' y 'tgcrypto' en el servidor."
+            )
+        acc = service.telegram_account_by_id[account_id]
+        # name + workdir must match the running client so the session lands at
+        # <state_dir>/<account_id>.session (see AppService telegram_clients).
+        return _PyrogramClient(
+            name=account_id,
+            api_id=acc.api_id,
+            api_hash=acc.api_hash,
+            workdir=str(state_dir),
+        )
+
+    def phone_for(account_id: str):
+        acc = service.telegram_account_by_id.get(account_id)
+        return acc.phone if acc else None
+
+    def session_path(account_id: str) -> str:
+        return str(state_dir / f"{account_id}.session")
+
+    def on_authorized(account_id: str) -> None:
+        # Drop the running server's cached client so it reloads the new session.
+        client = service.telegram_clients.get(account_id)
+        if client is not None:
+            client.reset()
+
+    return TelegramLoginManager(
+        client_factory=client_factory,
+        phone_for=phone_for,
+        session_path=session_path,
+        on_authorized=on_authorized,
+    )
+
+
+def create_web_app(service: AppService, login_manager: TelegramLoginManager | None = None) -> Flask:
     app = Flask(__name__)
     app.secret_key = service.secrets.flask_secret_key
     app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+
+    if login_manager is None:
+        login_manager = _build_login_manager(service)
 
     def require_login(view):
         @wraps(view)
@@ -358,6 +450,63 @@ def create_web_app(service: AppService) -> Flask:
     def trigger_verify():
         run_background("run_verify")
         return redirect(url_for("home"))
+
+    # ── Telegram interactive login ───────────────────────────────────────────
+    def _render_telegram_login(account_id: str, *, error=None, notice=None, status=400):
+        acc = service.telegram_account_by_id.get(account_id)
+        if acc is None:
+            abort(404)
+        body = render_template_string(
+            TELEGRAM_LOGIN_TEMPLATE,
+            account_id=account_id,
+            phone=acc.phone,
+            state=login_manager.state(account_id),
+            has_session=login_manager.has_session(account_id),
+            error=error,
+            notice=notice,
+        )
+        return (body, status) if error else body
+
+    @app.get("/telegram/<account_id>/login")
+    @require_login
+    def telegram_login(account_id: str):
+        return _render_telegram_login(account_id)
+
+    @app.post("/telegram/<account_id>/login/start")
+    @require_login
+    def telegram_login_start(account_id: str):
+        try:
+            login_manager.start(account_id)
+        except LoginError as exc:
+            return _render_telegram_login(account_id, error=str(exc))
+        return redirect(url_for("telegram_login", account_id=account_id))
+
+    @app.post("/telegram/<account_id>/login/code")
+    @require_login
+    def telegram_login_code(account_id: str):
+        code = request.form.get("code", "").strip()
+        try:
+            new_state = login_manager.submit_code(account_id, code)
+        except LoginError as exc:
+            return _render_telegram_login(account_id, error=str(exc))
+        notice = "Sesión autenticada correctamente." if new_state == AUTHORIZED else None
+        return _render_telegram_login(account_id, notice=notice)
+
+    @app.post("/telegram/<account_id>/login/password")
+    @require_login
+    def telegram_login_password(account_id: str):
+        password = request.form.get("password", "")
+        try:
+            login_manager.submit_password(account_id, password)
+        except LoginError as exc:
+            return _render_telegram_login(account_id, error=str(exc))
+        return _render_telegram_login(account_id, notice="Sesión autenticada correctamente.")
+
+    @app.post("/telegram/<account_id>/login/cancel")
+    @require_login
+    def telegram_login_cancel(account_id: str):
+        login_manager.cancel(account_id)
+        return redirect(url_for("telegram_login", account_id=account_id))
 
     return app
 

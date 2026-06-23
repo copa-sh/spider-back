@@ -364,7 +364,10 @@ Reglas de descubrimiento:
 
 Sesiones MTProto:
 
-- La primera vez que un número inicia sesión, Telegram envía un código por SMS. El archivo de sesión (`tg_account_<n>.session`) se guarda en `APP_STATE_DIR` (el volumen `/state`), así que conviene generarlo previamente en local y montarlo para que el contenedor arranque ya autenticado.
+- La primera vez que un número inicia sesión, Telegram envía un código por SMS/app. El archivo de sesión (`tg_account_<n>.session`) se guarda en `APP_STATE_DIR` (el volumen `/state`).
+- **Login desde la web (recomendado):** en el dashboard, cada cuenta Telegram muestra su estado de sesión y un enlace **«iniciar login / re-autenticar»**. Ese flujo hace el handshake completo (`send_code` → `sign_in` → 2FA si aplica) y deja el `.session` listo, sin generarlo a mano. Al completarse, el cliente en ejecución recarga la sesión nueva automáticamente. La sesión previa se aparta a `.session.bak` y se restaura si cancelas o falla el proceso.
+- **Alternativa out-of-band:** también puedes generar el `.session` en local (script interactivo de Pyrogram con el mismo `name`/`workdir`) y montarlo para que el contenedor arranque ya autenticado.
+- Si una sesión se revoca (`AUTH_KEY_UNREGISTERED`), el dashboard mostrará `sesión=presente` pero las subidas a Telegram fallarán: usa el enlace de re-autenticación para regenerarla.
 
 #### Variables genéricas de redes
 > Afectan a todas las redes por igual
@@ -399,9 +402,10 @@ docker compose logs -f spider-back
 Accede a `http://tu-servidor:8080`
 
 - `GET /login` + `POST /login`
-- `/` → Dashboard (últimas ejecuciones, cuotas, estado)
+- `/` → Dashboard (últimas ejecuciones, cuotas, estado, estado de sesión Telegram)
 - `/files` → Listado de archivos y versiones
 - `/logs` → Logs persistentes
+- `/telegram/<account_id>/login` → Login interactivo de Telegram (código + 2FA)
 - Acciones manuales: Sync, Full Sync, Verify
 
 ## Comandos (desarrollo y mantenimiento)
