@@ -554,8 +554,17 @@ def test_fails_when_all_accounts_are_over_daily_limit(tmp_path):
     (data_dir / "archivo.txt").write_text("hola", encoding="utf-8")
 
     sync = service.run_sync()
+    # La sync ya no se aborta entera al primer archivo sin destino: completa el
+    # escaneo y reporta el archivo como fallido (failed_files), de modo que con
+    # cuentas Telegram disponibles el resto de archivos sí podrían subirse.
     assert sync.ok is False
-    assert "cuota diaria" in sync.error
+    assert sync.summary["failed_files"] == 1
+    assert sync.summary["scanned_files"] == 1
+
+    # El motivo real queda registrado en el archivo y menciona el cupo de GitHub.
+    state_after = service.state_manager.load(service.default_config)
+    file_errors = [entry.get("last_error") for entry in state_after["files"].values()]
+    assert any(err and "cupo diario" in err for err in file_errors)
 
 
 def test_web_login_and_manual_actions(tmp_path):
@@ -747,6 +756,68 @@ def test_sync_places_copy_on_each_network(tmp_path):
     networks = {copy["network"] for copy in version["copies"]}
     assert networks == {"github", "telegram"}
     assert service.distinct_account_copy_count(version) == 2
+
+
+def _exhaust_github_quota(service):
+    state = service.state_manager.load(service.default_config)
+    today = service._today_bucket()
+    state["github_accounts"] = {
+        "account_1": {
+            "account_id": "account_1",
+            "owner": "owner-a",
+            "repositories": {},
+            "daily_uploads": {today: service.config.github_account_daily_upload_limit_bytes},
+            "last_metadata_refresh_at": None,
+            "last_upload_at": None,
+        },
+    }
+    service.state_manager.save(state)
+
+
+def test_sync_falls_back_to_telegram_when_github_quota_exhausted(tmp_path):
+    # Con GitHub sin cupo diario, la copia debe colocarse en Telegram en lugar
+    # de cancelar la subida (Telegram no tiene cupo diario).
+    service, data_dir = make_service_with_telegram(tmp_path)
+    _exhaust_github_quota(service)
+    (data_dir / "archivo.txt").write_bytes(b"contenido de prueba para telegram")
+
+    service.run_sync()
+
+    state = service.get_state()
+    version = next(iter(state["files"].values()))["versions"][0]
+    networks = {copy["network"] for copy in version["copies"]}
+    assert "telegram" in networks
+    assert "github" not in networks
+    assert version["copy_count_completed"] >= 1
+
+
+def test_unplaceable_file_does_not_abort_whole_sync(tmp_path):
+    # Regresión: antes, si GitHub estaba sin cupo y la copia en Telegram fallaba,
+    # se relanzaba NoAvailableAccountsError y se abortaba TODA la sync (summary
+    # vacío). Ahora el archivo se marca como fallido y la sync completa el
+    # escaneo, dejando el motivo real (Telegram) registrado.
+    from app.telegram_api import TelegramError
+
+    class FailingTelegramClient(FakeTelegramClient):
+        def commit_copy(self, *args, **kwargs):
+            raise TelegramError("canal no disponible")
+
+    service, data_dir = make_service_with_telegram(tmp_path)
+    service.telegram_clients = {"tg_account_1": FailingTelegramClient("tg_account_1")}
+    _exhaust_github_quota(service)
+    (data_dir / "archivo.txt").write_bytes(b"contenido de prueba")
+
+    sync = service.run_sync()
+
+    assert sync.ok is False
+    # summary poblado => el escaneo terminó (no se abortó a mitad)
+    assert sync.summary["scanned_files"] == 1
+    assert sync.summary["failed_files"] == 1
+
+    state = service.get_state()
+    file_entry = next(iter(state["files"].values()))
+    assert file_entry["last_error"]
+    assert "telegram" in file_entry["last_error"].lower()
 
 
 def test_verify_skips_telegram_copy_but_passes_github(tmp_path):

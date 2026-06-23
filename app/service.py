@@ -394,9 +394,16 @@ class AppService:
             LOGGER.info("sync archivo %s path=%s cuenta=%s repo=%s version=%s bytes=%s", "replicado" if version.get("replication_complete") else "parcial", rel_path, version["account_id"], version["repository"], version["version_id"], version["uploaded_bytes"])
 
         except NoAvailableAccountsError as exc:
-            entry["last_error"] = str(exc)
+            # Antes se relanzaba y abortaba TODA la sincronización en cuanto un
+            # archivo no encontraba destino (p.ej. GitHub sin cupo diario y la
+            # copia en Telegram fallaba). Eso cancelaba el resto de la sync aun
+            # habiendo cuentas Telegram disponibles. Ahora lo tratamos como un
+            # fallo de archivo más: lo registramos y continuamos, de modo que el
+            # resto de archivos (y sus copias en Telegram) siguen intentándose.
+            entry.update({"path": rel_path, "present": True, "size": size, "mtime_ns": mtime_ns, "source_sha256": source_sha256, "last_seen_at": utc_now_iso(), "last_error": str(exc)})
+            fail_files += 1
             self.state_manager.save(state)
-            raise  # Relanzamos para que el bucle principal lo capture y devuelva el TaskResult(False)
+            LOGGER.error("sync sin destino para path=%s: %s", rel_path, exc)
         except Exception as exc:
             entry.update({"path": rel_path, "present": True, "size": size, "mtime_ns": mtime_ns, "source_sha256": source_sha256, "last_seen_at": utc_now_iso(), "last_error": str(exc)})
             fail_files += 1
@@ -1111,6 +1118,10 @@ class AppService:
             except NoAvailableAccountsError:
                 break
             except ServiceError as exc:
+                LOGGER.warning(
+                    "sync copia GitHub fallida path=%s cuenta=%s: %s",
+                    rel_path, target.account_id, exc,
+                )
                 copy_errors.append(
                     {
                         "copy_index": len(copies) + 1,
@@ -1150,6 +1161,10 @@ class AppService:
                 copies.append(copy)
                 used_account_ids.add(tg_account.account_id)
             except (TelegramError, ServiceError) as exc:
+                LOGGER.warning(
+                    "sync copia Telegram fallida path=%s cuenta=%s: %s",
+                    rel_path, tg_account.account_id, exc,
+                )
                 copy_errors.append(
                     {
                         "copy_index": len(copies) + 1,
@@ -1161,7 +1176,26 @@ class AppService:
                 used_account_ids.add(tg_account.account_id)
 
         if not copies:
-            raise NoAvailableAccountsError("Ninguna cuenta GitHub tiene cuota diaria disponible para esta subida.")
+            # Mensaje honesto: antes siempre se culpaba al cupo de GitHub, aun
+            # cuando el verdadero motivo era un fallo en la copia de Telegram.
+            # Incluimos los errores reales por cuenta para poder diagnosticar.
+            error_details = "; ".join(
+                f"{err.get('network')}/{err.get('account_id')}: {err.get('error')}"
+                for err in copy_errors
+            )
+            if error_details:
+                message = f"No se pudo subir ninguna copia. Errores por cuenta: {error_details}"
+            elif self.config.telegram_accounts:
+                message = (
+                    "No se pudo subir ninguna copia: ninguna cuenta GitHub tiene cupo "
+                    "diario disponible y las cuentas Telegram no aceptaron la subida."
+                )
+            else:
+                message = (
+                    "No se pudo subir ninguna copia: ninguna cuenta GitHub tiene cupo "
+                    "diario disponible y no hay cuentas Telegram configuradas."
+                )
+            raise NoAvailableAccountsError(message)
 
         primary_copy = copies[0]
         version: dict[str, Any] = {
