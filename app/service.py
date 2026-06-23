@@ -1581,6 +1581,7 @@ class AppService:
             phone_display = phone[:4] + "****" + phone[-2:] if len(phone) > 6 else phone
             account_state = state.get("github_accounts", {}).get(acc.account_id, {})
             today = self._today_bucket()
+            session_file = self.config.app_state_dir / f"{acc.account_id}.session"
             tg_summaries.append(
                 {
                     "account_id": acc.account_id,
@@ -1591,6 +1592,7 @@ class AppService:
                     "uploaded_today_bytes": int(account_state.get("daily_uploads", {}).get(today, 0)),
                     "available": bool(account_state.get("available", True)),
                     "unavailable_reason": account_state.get("unavailable_reason"),
+                    "has_session": session_file.exists(),
                 }
             )
         state["telegram_account_summaries"] = tg_summaries
