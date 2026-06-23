@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 
 import pytest
 
@@ -204,3 +206,25 @@ def test_other_errors_are_normalized_to_telegram_error():
 
     with pytest.raises(TelegramError):
         client._request("explode", explode)
+
+
+def test_ensure_connection_works_from_non_main_thread():
+    # Regression: sync-scheduler thread had no event loop, causing
+    # Pyrogram's sync wrappers to raise RuntimeError.
+    errors: list[Exception] = []
+
+    def run_in_thread():
+        # Remove any event loop that may have been inherited
+        asyncio.set_event_loop(None)
+        try:
+            underlying = FakeUnderlyingClient()
+            client, _ = make_client(underlying)
+            client._ensure_connection()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t = threading.Thread(target=run_in_thread, name="sync-scheduler")
+    t.start()
+    t.join()
+
+    assert not errors, f"_ensure_connection raised in background thread: {errors}"
