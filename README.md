@@ -336,6 +336,36 @@ Reglas de descubrimiento:
 | `GITHUB_UPLOAD_SLEEP_MIN_SECONDS` | No | `0` | Límite inferior del sleep entre subidas. |
 | `GITHUB_UPLOAD_SLEEP_MAX_SECONDS` | No | `0` | Límite superior del sleep entre subidas. Debe ser mayor o igual que el mínimo. |
 
+#### Variables Telegram por cuenta
+
+El backend de Telegram usa MTProto (Pyrogram) para superar el límite de 50 MB de la Bot API y subir hasta ~2 GB por archivo. Los "repositorios" son **canales privados** y cada copia sube los chunks + un manifiesto JSON al canal.
+
+| Variable | Requerida | Valor por defecto | Efecto |
+| --- | --- | --- | --- |
+| `TG_ACCOUNT_<n>_API_ID` | Sí, junto con `API_HASH` y `PHONE` | - | API ID de Telegram (entero). Se obtiene en my.telegram.org. |
+| `TG_ACCOUNT_<n>_API_HASH` | Sí, junto con `API_ID` y `PHONE` | - | API hash de Telegram. |
+| `TG_ACCOUNT_<n>_PHONE` | Sí, junto con `API_ID` y `API_HASH` | - | Número con prefijo internacional (ej. `+34600000000`). El `account_id` resultante es `tg_account_<n>`. |
+
+Reglas de descubrimiento:
+
+- Telegram es **opcional**: si no defines ninguna cuenta `TG_ACCOUNT_<n>_*`, el backend Telegram simplemente no se usa y solo se sube a GitHub.
+- Cada cuenta numerada debe definir las **tres** variables (`API_ID`, `API_HASH`, `PHONE`); si falta alguna, la carga de configuración falla.
+- Para usar Telegram en tiempo de ejecución hay que instalar `pyrogram` (y `tgcrypto`); el cliente solo se importa cuando hay cuentas configuradas.
+
+#### Variables Telegram de almacenamiento
+
+| Variable | Requerida | Valor por defecto efectivo | Efecto |
+| --- | --- | --- | --- |
+| `TG_CHANNEL_PREFIX` | No | `spider-model` | Prefijo de los canales privados gestionados (análogo a `GITHUB_REPOSITORY_PREFIX`). Se normaliza quitando guiones finales. |
+| `TG_CHANNEL_PRIVATE` | No | `true` | Crea canales privados. |
+| `TG_TIMEOUT_SECONDS` | No | `900` | Timeout de operaciones MTProto. Más alto que GitHub porque la descarga MTProto de archivos grandes es notablemente más lenta. |
+| `TG_MAX_RETRY` | No | `3` | Número de reintentos por operación. |
+| `TG_BACKOFF_SECONDS` | No | `2` | Retardo base del backoff exponencial entre reintentos. Los `FloodWait` respetan además el tiempo exacto que exige Telegram. |
+
+Sesiones MTProto:
+
+- La primera vez que un número inicia sesión, Telegram envía un código por SMS. El archivo de sesión (`tg_account_<n>.session`) se guarda en `APP_STATE_DIR` (el volumen `/state`), así que conviene generarlo previamente en local y montarlo para que el contenedor arranque ya autenticado.
+
 #### Variables genéricas de redes
 > Afectan a todas las redes por igual
 
@@ -347,8 +377,9 @@ Notas de compatibilidad:
 
 - `.env.example` incluye valores de ejemplo más conservadores para `GITHUB_UPLOAD_SLEEP_MIN_SECONDS` y `GITHUB_UPLOAD_SLEEP_MAX_SECONDS`; si no se definen, el runtime no duerme entre subidas.
 - `GITHUB_REPOSITORY_PREFIX` se limpia con `strip("-")`, así que `model`, `model-` y `model--` terminan normalizándose al mismo prefijo efectivo.
-- `COPY_COUNT` debe ser menor o igual que el número total de cuentas configuradas en todas las redes. Dos copias bajo una misma cuenta cuentan como una sola.
-- `GITHUB_CHUNK_SIZE_MB` se interpreta en bytes al generar chunks, pero el tamaño efectivo nunca supera 95 MB por chunk.
+- `COPY_COUNT` debe ser menor o igual que el número total de cuentas configuradas en todas las redes (GitHub + Telegram). Dos copias bajo una misma cuenta cuentan como una sola.
+- `GITHUB_CHUNK_SIZE_MB` se interpreta en bytes al generar chunks, pero el tamaño efectivo nunca supera 95 MB por chunk. Telegram reutiliza estos mismos chunks cifrados (sin volver a cifrar).
+- Telegram (v1): se usa **un único canal por cuenta** (`<TG_CHANNEL_PREFIX>-0001`), sin rotación de canales todavía. La verificación (`verify`) marca las copias de Telegram como `skipped` (no `failed`) hasta que se implemente la descarga MTProto.
 
 ## Docker
 
