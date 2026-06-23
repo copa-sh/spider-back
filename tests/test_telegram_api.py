@@ -197,6 +197,62 @@ def test_request_gives_up_after_max_retry_on_connection_error():
         client._request("always_fail", always_fail)
 
 
+class AuthKeyUnregistered(Exception):
+    """Stand-in matching Pyrogram's class name (matched by name, not import)."""
+
+
+class RevokedDialogsClient(FakeUnderlyingClient):
+    """Raises the 401 auth-key error on get_dialogs, as a dead session would."""
+
+    def get_dialogs(self):
+        raise AuthKeyUnregistered(
+            "Telegram says: [401 AUTH_KEY_UNREGISTERED] - The key is not registered"
+        )
+
+
+def test_auth_key_unregistered_self_heals_by_reloading_session():
+    # Simulates the cross-process case: the in-memory client holds a revoked auth
+    # key, but the session was regenerated on disk (web re-login). The next
+    # factory call returns a working client — i.e. the reloaded session.
+    revoked = RevokedDialogsClient()
+    working = FakeUnderlyingClient(dialogs=[FakeChat(-1001, "spider-model-0001")])
+    factory_clients = [revoked, working]
+
+    settings = TelegramSettings(
+        api_id=123, api_hash="hash", phone_number="+34600000000",
+        session_name="tg_account_1", timeout_s=30, max_retry=3, backoff_s=1,
+    )
+    client = TelegramClient(
+        settings,
+        client_factory=lambda: factory_clients.pop(0),
+        sleeper=lambda *_: None,
+    )
+
+    channels = client.list_managed_channels("spider-model")
+
+    # Recovered: dropped the revoked client, reconnected with the fresh one.
+    assert [c.title for c in channels] == ["spider-model-0001"]
+    assert revoked.is_connected is False  # old client was disconnected by reset()
+    assert working.is_connected is True
+
+
+def test_auth_key_unregistered_still_fails_when_session_stays_dead():
+    # If every reload still yields a revoked session, we recover only once and
+    # then surface a TelegramError instead of looping forever.
+    settings = TelegramSettings(
+        api_id=123, api_hash="hash", phone_number="+34600000000",
+        session_name="tg_account_1", timeout_s=30, max_retry=3, backoff_s=1,
+    )
+    client = TelegramClient(
+        settings,
+        client_factory=lambda: RevokedDialogsClient(),
+        sleeper=lambda *_: None,
+    )
+
+    with pytest.raises(TelegramError):
+        client.list_managed_channels("spider-model")
+
+
 def test_other_errors_are_normalized_to_telegram_error():
     underlying = FakeUnderlyingClient()
     client, _ = make_client(underlying)
