@@ -49,6 +49,38 @@ class SchedulerThread(threading.Thread):
         self.stop_event.set()
 
 
+def _check_pyrogram_available() -> bool:
+    try:
+        import pyrogram  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _log_telegram_startup(config) -> None:
+    if not config.telegram_accounts:
+        LOGGER.info(
+            "Telegram: sin cuentas configuradas "
+            "(define TG_ACCOUNT_<n>_API_ID, TG_ACCOUNT_<n>_API_HASH y TG_ACCOUNT_<n>_PHONE para activar)."
+        )
+        return
+
+    pyrogram_ok = _check_pyrogram_available()
+    LOGGER.info("Telegram: %s cuenta(s) detectada(s). pyrogram=%s", len(config.telegram_accounts), "ok" if pyrogram_ok else "NO INSTALADO")
+    for acc in config.telegram_accounts:
+        phone = acc.phone
+        phone_display = phone[:4] + "****" + phone[-2:] if len(phone) > 6 else phone
+        LOGGER.info(
+            "Telegram cuenta: id=%s phone=%s api_id=%s",
+            acc.account_id, phone_display, acc.api_id,
+        )
+    if not pyrogram_ok:
+        LOGGER.warning(
+            "Telegram: pyrogram no esta instalado — las cuentas Telegram no podran conectarse. "
+            "Instala las dependencias: pip install pyrogram tgcrypto"
+        )
+
+
 def bootstrap_service() -> AppService:
     config = load_config()
     configure_file_logging(config.app_state_dir / "logs" / "spider-back.log")
@@ -60,6 +92,7 @@ def bootstrap_service() -> AppService:
         LOGGER.warning("APP_WEB_PIN no definido. PIN generado y guardado en /state/secrets.json: %s", secrets.web_pin)
     if generated["flask_secret_key"]:
         LOGGER.info("Flask secret generado y guardado en /state/secrets.json.")
+    _log_telegram_startup(config)
     service = AppService(config, secrets, state_manager)
     service.state_manager.load(service.default_config)
     return service

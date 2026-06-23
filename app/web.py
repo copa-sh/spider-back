@@ -47,6 +47,25 @@ HOME_TEMPLATE = """
       </li>
       {% endfor %}
     </ul>
+    <h2>Cuentas Telegram</h2>
+    {% if state.telegram_account_summaries %}
+      {% if not state.pyrogram_available %}
+      <p><strong>⚠ pyrogram no está instalado.</strong> Las cuentas Telegram no pueden conectarse. Instala: <code>pip install pyrogram tgcrypto</code></p>
+      {% endif %}
+      <ul>
+        {% for account in state.telegram_account_summaries %}
+        <li>
+          {{ account.account_id }} | phone={{ account.phone }} | api_id={{ account.api_id }} |
+          pyrogram={{ "ok" if account.pyrogram_available else "NO INSTALADO" }} |
+          disponible={{ "si" if account.available else "no" }} |
+          hoy={{ account.uploaded_today_bytes }} bytes
+          {% if account.unavailable_reason %}| ⚠ {{ account.unavailable_reason }}{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>No hay cuentas Telegram configuradas. Define <code>TG_ACCOUNT_&lt;n&gt;_API_ID</code>, <code>TG_ACCOUNT_&lt;n&gt;_API_HASH</code> y <code>TG_ACCOUNT_&lt;n&gt;_PHONE</code>.</p>
+    {% endif %}
     <h2>Alertas</h2>
     {% if state.github_account_alerts %}
     <table border="1" cellpadding="6" cellspacing="0">

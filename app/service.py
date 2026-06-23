@@ -1535,6 +1535,33 @@ class AppService:
             if summary["alerts"] or not summary["available"]
         ]
 
+        try:
+            import pyrogram  # noqa: F401
+            pyrogram_available = True
+        except ImportError:
+            pyrogram_available = False
+
+        tg_summaries = []
+        for acc in self.config.telegram_accounts:
+            phone = acc.phone
+            phone_display = phone[:4] + "****" + phone[-2:] if len(phone) > 6 else phone
+            account_state = state.get("github_accounts", {}).get(acc.account_id, {})
+            today = self._today_bucket()
+            tg_summaries.append(
+                {
+                    "account_id": acc.account_id,
+                    "phone": phone_display,
+                    "api_id": acc.api_id,
+                    "network": "telegram",
+                    "pyrogram_available": pyrogram_available,
+                    "uploaded_today_bytes": int(account_state.get("daily_uploads", {}).get(today, 0)),
+                    "available": bool(account_state.get("available", True)),
+                    "unavailable_reason": account_state.get("unavailable_reason"),
+                }
+            )
+        state["telegram_account_summaries"] = tg_summaries
+        state["pyrogram_available"] = pyrogram_available
+
     @staticmethod
     def _today_bucket() -> str:
         return utc_now_iso().split("T", 1)[0]
