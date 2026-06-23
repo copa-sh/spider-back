@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass
@@ -117,6 +118,15 @@ class TelegramClient:
 
     def _ensure_connection(self) -> Any:
         """Asegura que el cliente MTProto está conectado."""
+        # Pyrogram's sync wrappers call asyncio.get_event_loop() internally.
+        # Non-main threads (e.g. sync-scheduler) have no loop by default — create one.
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("closed")
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+
         if self._client is None:
             self._client = self._client_factory()
         if not getattr(self._client, "is_connected", False):
