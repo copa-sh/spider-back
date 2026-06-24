@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import time
@@ -259,9 +260,15 @@ class TelegramClient:
         """Sube un fragmento como documento (send_document soporta >20MB)."""
 
         def _send() -> UploadedChunkMeta:
+            # Pyrogram's send_document rejects raw bytes ("Expected a file path as
+            # string or a binary (not text) file pointer"); it needs a path or a
+            # binary file-like object. Wrap the chunk in an in-memory stream and
+            # give it a .name so Pyrogram can derive the upload filename.
+            stream = io.BytesIO(chunk_data)
+            stream.name = filename
             msg = self._client.send_document(
                 chat_id=chat_id,
-                document=chunk_data,
+                document=stream,
                 file_name=filename,
                 disable_notification=True,
                 force_document=True,
