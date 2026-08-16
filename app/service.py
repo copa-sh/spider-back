@@ -503,9 +503,6 @@ class AppService:
         failed = counters["failed"]
         return TaskResult(failed == 0, summary, None if failed == 0 else f"{failed} archivos con error")
 
-    def _finalize_sync(self, state: dict[str, Any]) -> None:
-        """Hook for end-of-run remote bookkeeping. Overridden by the Releases backend."""
-
     def _log_scan_progress(self, counters: dict[str, int], path: str, last_log_at: float) -> float:
         scanned = counters["scanned"]
         if scanned == 1 or scanned % 100 == 0 or time.monotonic() - last_log_at >= 10:
@@ -813,14 +810,6 @@ class AppService:
             },
             None if failures == 0 else f"{failures} archivos con error",
         )
-
-    def _remote_asset_index(self) -> dict[str, dict[str, int]]:
-        """Presence and size of every remote asset, one listing per release.
-
-        Empty while no data has been written through the Releases backend; the
-        commit-based layout has no equivalent cheap listing.
-        """
-        return {}
 
     def _verify_copy(
         self,
@@ -1425,6 +1414,9 @@ class AppService:
                 entry["path"] = row.rel_path
                 entry["size"] = row.size
                 entry["source_sha256"] = row.source_sha256
+            # Dedup means several paths can share one version; all of them have
+            # to be listed or a restore from the manifest alone would lose them.
+            entry["paths"] = self.registry.paths_for_version(entry["version_id"])
             entry["assets"].sort(key=lambda item: item["part"])
 
         payload = json.dumps(

@@ -212,8 +212,14 @@ FILE_TEMPLATE = """
     <h1>{{ file.path }}</h1>
     <p><a href="{{ url_for('files') }}">Volver</a></p>
     <p><strong>Presente:</strong> {{ file.present }}</p>
+    <p><strong>Estado:</strong> {{ file.status }}</p>
     <p><strong>SHA al subir:</strong> {{ file.source_sha256 }}</p>
-    <p><strong>Ultima verificacion:</strong> {{ file.last_verification.checked_at if file.last_verification else "nunca" }}</p>
+    <p><strong>Ultima verificacion:</strong>
+      {% if file.last_verification %}
+        {{ file.last_verification.checked_at }} ({{ file.last_verification.depth or "deep" }},
+        {{ "ok" if file.last_verification.ok else "fallo" }})
+      {% else %}nunca{% endif %}
+    </p>
     <p><strong>Version activa:</strong> {{ file.active_version_id or "ninguna" }}</p>
     <p><strong>Error:</strong> {{ file.last_error or "ninguno" }}</p>
     <h2>Versiones</h2>
@@ -221,16 +227,22 @@ FILE_TEMPLATE = """
       {% for version in file.versions|reverse %}
       <li>
         {{ version.version_id }} | {{ version.created_at }} |
-        <a href="{{ version.manifest_raw_url }}">manifest</a> |
+        almacenamiento={{ version.storage or "blob" }} |
         copias={{ version.copies|length }} |
-        chunks={{ version.chunks|length }} |
-        commit={{ version.commit_sha or "pendiente" }} |
         sha={{ version.plaintext_sha256 }} |
-        cuenta={{ version.account_id }} |
-        repo={{ version.repository_owner }}/{{ version.repository }}
+        cuenta={{ version.account_id }}
         <ul>
           {% for copy in version.copies %}
-          <li>{{ copy.copy_index }}: {{ copy.network }} {{ copy.account_id }} {{ copy.repository_owner }}/{{ copy.repository }} commit={{ copy.commit_sha or "pendiente" }}</li>
+          <li>
+            {{ copy.copy_index }}: {{ copy.network }} {{ copy.account_id }}
+            {% if copy.storage == "release" %}
+              release={{ copy.release_tag }} partes={{ copy.parts|length }}
+              repo={{ copy.repository_owner }}/{{ copy.repository }}
+            {% else %}
+              chunks={{ copy.chunks|length }} commit={{ copy.commit_sha or "pendiente" }}
+              repo={{ copy.repository_owner }}/{{ copy.repository }}
+            {% endif %}
+          </li>
           {% endfor %}
         </ul>
       </li>

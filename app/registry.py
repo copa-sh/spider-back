@@ -532,6 +532,18 @@ class Registry:
         ).fetchone()
         return json.loads(row["version_json"]) if row else None
 
+    def paths_for_version(self, version_id: str) -> list[str]:
+        """Every local path whose active version is this one.
+
+        Content dedup means two paths can share a single remote version, and the
+        consolidated manifest is the only remote record of that mapping — so it
+        has to list them all, not just the one that uploaded the bytes.
+        """
+        rows = self.connection.execute(
+            "SELECT rel_path FROM files WHERE version_id = ? ORDER BY rel_path", (version_id,)
+        ).fetchall()
+        return [row["rel_path"] for row in rows]
+
     def list_versions(self, file_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT version_json FROM versions WHERE file_id = ? ORDER BY created_at, version_id",

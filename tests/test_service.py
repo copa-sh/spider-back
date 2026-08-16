@@ -1367,3 +1367,54 @@ def test_legacy_blob_copy_still_verifies_through_raw_url(tmp_path):
     detail = service.get_file_detail(file_id)["last_verification"]
     assert detail["copies"][0]["storage"] == "blob"
     assert detail["copies"][0]["remote_sha256"] == encrypted["plaintext_sha256"]
+
+
+def test_empty_file_round_trips(tmp_path):
+    """A zero-byte file still produces one part (header + GCM tag), so the
+    non-empty-asset check must not reject it."""
+    service, data_dir, _ = make_service(tmp_path)
+    (data_dir / "vacio.bin").write_bytes(b"")
+
+    assert service.run_sync().ok is True
+    parts = active_version(service, only_file(service).file_id)["copies"][0]["parts"]
+    assert len(parts) == 1
+    assert parts[0]["size"] > 0
+    assert service.run_verify().ok is True
+
+
+def test_file_detail_page_describes_release_versions(tmp_path):
+    service, data_dir, _ = make_service(tmp_path)
+    (data_dir / "archivo.txt").write_text("contenido", encoding="utf-8")
+    assert service.run_sync().ok is True
+
+    app = create_web_app(service)
+    client = app.test_client()
+    client.post("/login", data={"pin": "12345678"})
+
+    response = client.get(f"/files/{only_file(service).file_id}")
+    assert response.status_code == 200
+    body = response.data.decode("utf-8")
+    assert "almacenamiento=release" in body
+    assert "release=model-0001" in body
+    assert "partes=1" in body
+
+
+def test_files_listing_is_paginated(tmp_path):
+    service, data_dir, _ = make_service(tmp_path)
+    for index in range(5):
+        (data_dir / f"archivo{index}.txt").write_text(f"contenido {index}", encoding="utf-8")
+    assert service.run_sync().ok is True
+
+    app = create_web_app(service)
+    client = app.test_client()
+    client.post("/login", data={"pin": "12345678"})
+
+    first = client.get("/files?per_page=2")
+    assert first.status_code == 200
+    assert b"archivo0.txt" in first.data
+    assert b"archivo2.txt" not in first.data
+    assert b"siguiente" in first.data
+
+    second = client.get("/files?per_page=2&page=2")
+    assert b"archivo2.txt" in second.data
+    assert b"archivo0.txt" not in second.data
