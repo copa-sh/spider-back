@@ -22,6 +22,14 @@ DEFAULT_REPOSITORY_PREFIX = "model"
 DEFAULT_CONTENT_REQUESTS_PER_HOUR = 450
 DEFAULT_CONTENT_REQUESTS_PER_MINUTE = 70
 DEFAULT_MAX_CONCURRENCY = 3
+# One release asset per file when it fits; ~1 GiB parts otherwise. The hard
+# per-asset ceiling is 2 GiB, and each part costs exactly one content-generating
+# request, so bigger parts use the scarce budget better (24 MiB chunks waste it).
+DEFAULT_PART_SIZE_MB = 1024
+MAX_PART_SIZE_MB = 1900
+# Deep (download + hash) verification covers 1 file in every N per run. N=1
+# checks everything; N=100 covers the whole set across 100 runs with no overlap.
+DEFAULT_VERIFY_DEEP_EVERY_N = 1
 
 
 class ConfigError(Exception):
@@ -156,10 +164,16 @@ class AppConfig:
     github_content_requests_per_hour: int = DEFAULT_CONTENT_REQUESTS_PER_HOUR
     github_content_requests_per_minute: int = DEFAULT_CONTENT_REQUESTS_PER_MINUTE
     github_max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    github_part_size_mb: int = DEFAULT_PART_SIZE_MB
+    verify_deep_every_n: int = DEFAULT_VERIFY_DEEP_EVERY_N
 
     @property
     def github_chunk_size_bytes(self) -> int:
         return min(self.github_chunk_size_mb, 95) * 1024 * 1024
+
+    @property
+    def github_part_size_bytes(self) -> int:
+        return min(self.github_part_size_mb, MAX_PART_SIZE_MB) * 1024 * 1024
 
     @property
     def github_account_daily_upload_limit_bytes(self) -> int:
@@ -321,6 +335,8 @@ def load_config() -> AppConfig:
             "GITHUB_CONTENT_REQUESTS_PER_MINUTE", DEFAULT_CONTENT_REQUESTS_PER_MINUTE
         ),
         github_max_concurrency=_env_int("GITHUB_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY),
+        github_part_size_mb=_env_int("GITHUB_PART_SIZE_MB", DEFAULT_PART_SIZE_MB),
+        verify_deep_every_n=_env_int("VERIFY_DEEP_EVERY_N", DEFAULT_VERIFY_DEEP_EVERY_N),
     )
 
     config.app_state_dir.mkdir(parents=True, exist_ok=True)

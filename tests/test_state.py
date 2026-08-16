@@ -16,7 +16,9 @@ def test_bootstrap_secrets_creates_file(tmp_path):
 def test_load_initial_state(tmp_path):
     manager = StateManager(tmp_path)
     state = manager.load({"repository": "owner/repo"})
-    assert state["files"] == {}
+    # index.json holds config, tasks and accounts only — the file map lives in
+    # the SQLite registry.
+    assert "files" not in state
     assert state["tasks"]["sync"]["last_result"] == "never"
     assert "sync_by_name" not in state["tasks"]
     assert state["tasks"]["verify"]["last_result"] == "never"

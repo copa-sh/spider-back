@@ -27,3 +27,31 @@ def test_iter_files_yields_all_files(tmp_path):
 
     paths = {path.relative_to(root).as_posix() for path in iter_files(root)}
     assert paths == {"a.txt", "b/c.txt"}
+
+
+def test_iter_files_is_deterministically_ordered(tmp_path):
+    """The walk used to shuffle, which destroyed locality and resumability: an
+    interrupted sync restarted in a different order every time."""
+    root = tmp_path / "root"
+    (root / "sub").mkdir(parents=True)
+    for name in ("z.txt", "a.txt", "m.txt"):
+        (root / name).write_text(name, encoding="utf-8")
+    for name in ("y.txt", "b.txt"):
+        (root / "sub" / name).write_text(name, encoding="utf-8")
+
+    first = [path.relative_to(root).as_posix() for path in iter_files(root)]
+    second = [path.relative_to(root).as_posix() for path in iter_files(root)]
+
+    assert first == second
+    assert first == sorted(first)
+
+
+def test_iter_files_streams_without_materializing_the_tree(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    for index in range(5):
+        (root / f"f{index}.txt").write_text("x", encoding="utf-8")
+
+    walker = iter_files(root)
+    # A generator must yield before the whole tree has been walked.
+    assert next(iter(walker)).name == "f0.txt"

@@ -22,6 +22,17 @@ except ImportError:  # pragma: no cover - fallback for local environments
 from .config import AppConfig, GitHubAccountConfig, TelegramAccountConfig, RuntimeSecrets
 from .crypto import StreamingAESGCMDecryptor, chunk_bytes, encrypt_bytes, encrypt_bytes_with_nonce
 from .github_api import GitHubClient, GitHubError, GitHubSettings, RepositoryInfo
+from .registry import (
+    STATUS_COMPLETE,
+    STATUS_ERROR,
+    STATUS_UPLOADING,
+    STORAGE_BLOB,
+    STORAGE_RELEASE,
+    Registry,
+    distinct_account_copy_count,
+    import_legacy_files,
+    version_storage,
+)
 from .telegram_api import TelegramClient, TelegramError, TelegramSettings
 from .state import StateManager
 from .utils import (
@@ -36,6 +47,8 @@ from .utils import (
 
 
 LOGGER = logging.getLogger("spider-back")
+
+LEGACY_IMPORT_FLAG = "index_json_files_migrated"
 
 
 class ServiceError(Exception):
@@ -135,6 +148,7 @@ class AppService:
             "verify": self.config.app_state_dir / "verify.lock",
         }
         self._upload_index_path = self.config.app_state_dir / "upload_index.sqlite3"
+        self.registry = Registry(self._upload_index_path)
         self._runtime_unavailable_accounts: set[str] = set()
         self._choose = chooser or random.choice
         self._sleep_sampler = sleep_sampler or random.uniform
@@ -142,12 +156,32 @@ class AppService:
         # live in-memory state while a task is running (used by web UI to reflect progress)
         self._live_state: dict[str, Any] | None = None
         self._live_state_lock = threading.RLock()
-        # cada cuantos archivos volcar el estado a disco durante una sync
-        self._state_flush_every = 10
+        self._import_legacy_file_map()
+
+    def _import_legacy_file_map(self) -> None:
+        """Move ``index.json["files"]`` into the registry, once.
+
+        index.json was rewritten in full on every save and re-parsed on every
+        page load; with tens of thousands of files that dominated startup. The
+        map now lives in SQLite and index.json keeps only config, tasks and
+        accounts. Guarded by a meta flag so it runs at most once per state dir.
+        """
+        if self.registry.get_meta(LEGACY_IMPORT_FLAG) == "1":
+            return
+        state = self.state_manager.load(self.default_config)
+        legacy_files = state.get("files") or {}
+        if legacy_files:
+            imported = import_legacy_files(legacy_files, self.registry)
+            LOGGER.info("registro: %s archivos importados desde index.json", imported)
+        if "files" in state:
+            state.pop("files", None)
+            self.state_manager.save(state)
+        self.registry.set_meta(LEGACY_IMPORT_FLAG, "1")
 
     def get_state(self) -> dict[str, Any]:
         # If a task is running, prefer the live in-memory state so the web UI
-        # can show progress (new files/versions) before they're persisted.
+        # can show progress before it is persisted. The file map is NOT part of
+        # this any more: it lives in the registry and is queried on demand.
         with self._live_state_lock:
             live = deepcopy(self._live_state) if self._live_state is not None else None
 
@@ -160,11 +194,45 @@ class AppService:
         self._augment_state_for_web(state)
         return state
 
-    def run_sync(self) -> TaskResult:
-        return self._run_task("sync", lambda state: self._sync_impl(state, full=False))
+    def get_stats(self) -> dict[str, Any]:
+        """Aggregate file counters, computed in SQL rather than in Python."""
+        return self.registry.stats(copy_count_target=self.config.copy_count)
 
-    def run_full_sync(self) -> TaskResult:
-        return self._run_task("sync", lambda state: self._sync_impl(state, full=True))
+    def list_files(self, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]:
+        rows = self.registry.list_files(limit=limit, offset=offset)
+        return [
+            {
+                "file_id": row.file_id,
+                "path": row.rel_path,
+                "present": row.present,
+                "status": row.status,
+                "version_id": row.version_id,
+                "last_error": row.last_error,
+                "last_verified_at": row.last_verified_at,
+                "last_verification_ok": row.last_verification_ok,
+            }
+            for row in rows
+        ]
+
+    def get_file_detail(self, file_id: str) -> dict[str, Any] | None:
+        row = self.registry.get_file(file_id)
+        if row is None:
+            return None
+        return {
+            "file_id": row.file_id,
+            "path": row.rel_path,
+            "present": row.present,
+            "size": row.size,
+            "status": row.status,
+            "source_sha256": row.source_sha256,
+            "active_version_id": row.version_id,
+            "last_error": row.last_error,
+            "last_verification": self.registry.verification_detail(file_id),
+            "versions": self.registry.list_versions(file_id),
+        }
+
+    def run_sync(self) -> TaskResult:
+        return self._run_task("sync", self._sync_impl)
 
     def run_verify(self) -> TaskResult:
         return self._run_task("verify", self._verify_impl)
@@ -258,208 +326,389 @@ class AppService:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             return False
 
-    def _sync_impl(self, state: dict[str, Any], *, full: bool) -> TaskResult:
+    def _sync_impl(self, state: dict[str, Any]) -> TaskResult:
+        """Upload what is new or changed, and nothing else.
+
+        There is one sync mode. The old pair forced a bad trade: the light sync
+        trusted the persisted version and never re-hashed, so it did not detect
+        modifications at all; the only way to notice a change was the full sync,
+        which re-hashed every file. Comparing ``(size, mtime_ns)`` against the
+        registry makes a single mode both fast and correct — an unchanged file
+        is skipped without being hashed or even opened, so the startup cost is
+        proportional to the number of changes rather than to the total volume.
+        """
         if not self.config.app_data_dir.exists():
             raise ServiceError(f"No existe el directorio de datos: {self.config.app_data_dir}")
 
         self._ensure_github_accounts_state(state)
-        LOGGER.info("sync escaneando directorio=%s modo=%s", self.config.app_data_dir, "full" if full else "light")
-        files_state = state["files"]
-        discovered_paths: set[str] = set()
-        
-        scanned_files = 0
-        unchanged_files = 0
-        synced_or_reused_files = 0
-        uploaded_files = 0
-        failed_files = 0
-        uploaded_bytes = 0
-        last_scan_log_at = time.monotonic()
-        processed_since_flush = 0
+        run = self.registry.next_counter("sync_run")
+        LOGGER.info("sync escaneando directorio=%s run=%s", self.config.app_data_dir, run)
+
+        counters = {
+            "scanned": 0,
+            "unchanged": 0,
+            "metadata_only": 0,
+            "reused": 0,
+            "uploaded": 0,
+            "failed": 0,
+            "uploaded_bytes": 0,
+        }
+        last_log_at = time.monotonic()
 
         for file_path in iter_files(self.config.app_data_dir):
             rel_path = rel_path_str(self.config.app_data_dir, file_path)
-            discovered_paths.add(rel_path)
-            scanned_files += 1
             file_id = stable_file_id(rel_path)
-            stat = file_path.stat()
+            try:
+                stat = file_path.stat()
+            except OSError as exc:
+                LOGGER.warning("sync no se pudo inspeccionar path=%s: %s", rel_path, exc)
+                continue
             size = stat.st_size
             mtime_ns = stat.st_mtime_ns
+            counters["scanned"] += 1
 
-            entry = files_state.get(file_id)
-            active_version = self._get_active_version(entry) if entry else None
-            
-            # 1. Sin cambios
-            if self._is_file_already_synced(entry, active_version, size, mtime_ns, full=full):
-                entry["size"] = size
-                entry["mtime_ns"] = mtime_ns
-                entry["present"] = True
-                entry["last_seen_at"] = utc_now_iso()
-                unchanged_files += 1
-                self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
+            row = self.registry.get_file(file_id)
+
+            # 1. Unchanged: one indexed lookup, then skip without hashing and
+            #    without touching the file. This is the fast startup.
+            if (
+                row is not None
+                and row.status == STATUS_COMPLETE
+                and row.present
+                and row.size == size
+                and row.mtime_ns == mtime_ns
+            ):
+                self.registry.touch_file(file_id, size=size, mtime_ns=mtime_ns, seen_run=run)
+                counters["unchanged"] += 1
+                last_log_at = self._log_scan_progress(counters, rel_path, last_log_at)
                 continue
 
             source_sha256 = sha256_file(file_path)
-            
-            # 2. Mismo hash, pero replicación incompleta (reanudar)
-            if active_version and active_version.get("plaintext_sha256") == source_sha256 and entry.get("present"):
-                entry.update({"size": size, "mtime_ns": mtime_ns, "source_sha256": source_sha256, "present": True, "last_seen_at": utc_now_iso()})
-                
-                if active_version.get("replication_complete", True):
-                    unchanged_files += 1
-                    self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
-                    continue
+            resume_version: dict[str, Any] | None = None
 
-                # Subida inmediata
-                uploaded_files, failed_files, uploaded_bytes, processed_since_flush = self._process_upload(
-                    state, files_state, file_id, file_path, rel_path, size, mtime_ns, source_sha256, active_version,
-                    uploaded_files, failed_files, uploaded_bytes, processed_since_flush
-                )
-                self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
-                continue
-
-            # 3. Hash ya existe en otro lado (reutilizar)
-            existing_version = self._lookup_uploaded_version(source_sha256)
-            if existing_version is not None:
-                existing_version = self._normalize_version(existing_version)
-                if not existing_version.get("replication_complete", True):
-                    # Subida inmediata para completar
-                    uploaded_files, failed_files, uploaded_bytes, processed_since_flush = self._process_upload(
-                        state, files_state, file_id, file_path, rel_path, size, mtime_ns, source_sha256, existing_version,
-                        uploaded_files, failed_files, uploaded_bytes, processed_since_flush
+            # 2. Metadata moved but content did not (a touch, a restore, a
+            #    re-copy): record the new size/mtime and re-upload nothing.
+            if row is not None and row.source_sha256 == source_sha256:
+                active = self.registry.get_active_version(file_id)
+                if active is not None and self._is_version_replication_complete(active):
+                    self.registry.upsert_file(
+                        file_id=file_id,
+                        rel_path=rel_path,
+                        size=size,
+                        mtime_ns=mtime_ns,
+                        source_sha256=source_sha256,
+                        version_id=active["version_id"],
+                        status=STATUS_COMPLETE,
+                        present=True,
+                        last_error=None,
+                        seen_run=run,
                     )
-                    self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
+                    changed_metadata = row.size != size or row.mtime_ns != mtime_ns
+                    counters["metadata_only" if changed_metadata else "unchanged"] += 1
+                    last_log_at = self._log_scan_progress(counters, rel_path, last_log_at)
                     continue
-                    
-                entry = files_state.setdefault(file_id, {"file_id": file_id, "path": rel_path, "versions": [], "active_version_id": None, "last_verification": None, "last_error": None})
-                self._apply_existing_version_entry(entry, rel_path=rel_path, size=size, mtime_ns=mtime_ns, source_sha256=source_sha256, version=existing_version)
-                if existing_version.get("replication_complete", True):
-                    self._mark_uploaded_copy_seen(source_sha256)
-                synced_or_reused_files += 1
-                self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
-                continue
+                # Same content, but the version never finished replicating.
+                resume_version = active
 
-            # 4. Archivo completamente nuevo (Subida inmediata)
-            uploaded_files, failed_files, uploaded_bytes, processed_since_flush = self._process_upload(
-                state, files_state, file_id, file_path, rel_path, size, mtime_ns, source_sha256, None,
-                uploaded_files, failed_files, uploaded_bytes, processed_since_flush
+            # 3. This content is already stored under some other path: adopt the
+            #    remote version rather than uploading the same bytes twice.
+            if resume_version is None:
+                existing = self.registry.lookup_uploaded_version(source_sha256)
+                if existing is not None:
+                    existing = self._normalize_version(existing)
+                    if self._is_version_replication_complete(existing):
+                        self._adopt_version(
+                            file_id=file_id,
+                            rel_path=rel_path,
+                            size=size,
+                            mtime_ns=mtime_ns,
+                            source_sha256=source_sha256,
+                            version=existing,
+                            run=run,
+                        )
+                        self.registry.mark_uploaded_copy_seen(source_sha256)
+                        counters["reused"] += 1
+                        last_log_at = self._log_scan_progress(counters, rel_path, last_log_at)
+                        continue
+                    resume_version = existing
+
+            # 4. New content, or a version whose replication has to be finished.
+            self._process_upload(
+                state,
+                file_id=file_id,
+                file_path=file_path,
+                rel_path=rel_path,
+                size=size,
+                mtime_ns=mtime_ns,
+                source_sha256=source_sha256,
+                resume_version=resume_version,
+                run=run,
+                counters=counters,
             )
-            self._log_scan_progress(scanned_files, failed_files, unchanged_files + synced_or_reused_files, rel_path, last_scan_log_at)
+            last_log_at = self._log_scan_progress(counters, rel_path, last_log_at)
 
-        # Esto se ejecuta solo si el escaneo termina con éxito
-        LOGGER.info("sync analizado: %s archivos detectados, %s subidos/reutilizados, %s sin cambios.", len(discovered_paths), uploaded_files + synced_or_reused_files, unchanged_files)
-        
-        # Marcado de archivos eliminados (ahora es seguro porque terminamos de escanear)
-        for entry in files_state.values():
-            if entry["path"] not in discovered_paths:
-                entry["present"] = False
-                entry["last_seen_at"] = utc_now_iso()
+        # Only safe now that the walk completed: an aborted walk would flag
+        # every path it had not reached yet as missing.
+        self.registry.mark_absent_except_run(run)
+        self._finalize_sync(state)
+        self.state_manager.save(state)
 
-        self.state_manager.save(state) # Guardado final
+        LOGGER.info(
+            "sync terminado: revisados=%s subidos=%s reutilizados=%s solo_metadatos=%s sin_cambios=%s errores=%s",
+            counters["scanned"],
+            counters["uploaded"],
+            counters["reused"],
+            counters["metadata_only"],
+            counters["unchanged"],
+            counters["failed"],
+        )
         summary = {
-            "scanned_files": len(discovered_paths),
-            "uploaded_files": uploaded_files,
-            "reused_files": synced_or_reused_files,
-            "failed_files": failed_files,
-            "uploaded_bytes": uploaded_bytes,
-            "missing_files": sum(1 for entry in files_state.values() if not entry.get("present")),
+            "scanned_files": counters["scanned"],
+            "unchanged_files": counters["unchanged"],
+            "metadata_only_files": counters["metadata_only"],
+            "uploaded_files": counters["uploaded"],
+            "reused_files": counters["reused"],
+            "failed_files": counters["failed"],
+            "uploaded_bytes": counters["uploaded_bytes"],
+            "missing_files": self.registry.stats()["absent"],
         }
-        return TaskResult(failed_files == 0, summary, None if failed_files == 0 else f"{failed_files} archivos con error")
-    
-    def _log_scan_progress(self, scanned, failed, ok, path, last_log_time):
-        if scanned == 1 or scanned % 100 == 0 or time.monotonic() - last_log_time >= 10:
-            LOGGER.info("sync progreso: revisados=%s errores=%s al_dia=%s ultimo=%s", scanned, failed, ok, path)
-            last_log_time = time.monotonic()
-        return last_log_time
+        failed = counters["failed"]
+        return TaskResult(failed == 0, summary, None if failed == 0 else f"{failed} archivos con error")
 
-    def _process_upload(self, state, files_state, file_id, file_path, rel_path, size, mtime_ns, source_sha256, resume_version, up_files, fail_files, up_bytes, flush_count):
-        entry = files_state.setdefault(file_id, {"file_id": file_id, "path": rel_path, "versions": [], "active_version_id": None, "last_verification": None, "last_error": None})
+    def _finalize_sync(self, state: dict[str, Any]) -> None:
+        """Hook for end-of-run remote bookkeeping. Overridden by the Releases backend."""
+
+    def _log_scan_progress(self, counters: dict[str, int], path: str, last_log_at: float) -> float:
+        scanned = counters["scanned"]
+        if scanned == 1 or scanned % 100 == 0 or time.monotonic() - last_log_at >= 10:
+            LOGGER.info(
+                "sync progreso: revisados=%s sin_cambios=%s solo_metadatos=%s reutilizados=%s "
+                "subidos=%s errores=%s ultimo=%s",
+                scanned,
+                counters["unchanged"],
+                counters["metadata_only"],
+                counters["reused"],
+                counters["uploaded"],
+                counters["failed"],
+                path,
+            )
+            return time.monotonic()
+        return last_log_at
+
+    def _adopt_version(
+        self,
+        *,
+        file_id: str,
+        rel_path: str,
+        size: int,
+        mtime_ns: int,
+        source_sha256: str,
+        version: dict[str, Any],
+        run: int,
+    ) -> None:
+        version = self._normalize_version(version)
+        self.registry.save_version(
+            file_id,
+            version,
+            distinct_account_copies=distinct_account_copy_count(version),
+            storage=version_storage(version),
+        )
+        self.registry.upsert_file(
+            file_id=file_id,
+            rel_path=rel_path,
+            size=size,
+            mtime_ns=mtime_ns,
+            source_sha256=source_sha256,
+            version_id=version["version_id"],
+            status=STATUS_COMPLETE,
+            present=True,
+            last_error=None,
+            seen_run=run,
+        )
+        self.registry.clear_verification(file_id)
+
+    def _process_upload(
+        self,
+        state: dict[str, Any],
+        *,
+        file_id: str,
+        file_path: Path,
+        rel_path: str,
+        size: int,
+        mtime_ns: int,
+        source_sha256: str,
+        resume_version: dict[str, Any] | None,
+        run: int,
+        counters: dict[str, int],
+    ) -> None:
+        # Written before the upload starts so an interrupted run leaves an
+        # `uploading` row the next sync can reconcile against the remote.
+        self.registry.upsert_file(
+            file_id=file_id,
+            rel_path=rel_path,
+            size=size,
+            mtime_ns=mtime_ns,
+            source_sha256=source_sha256,
+            status=STATUS_UPLOADING,
+            present=True,
+            last_error=None,
+            seen_run=run,
+        )
+        LOGGER.info(
+            "sync %s path=%s size=%sB", "completando" if resume_version else "subiendo", rel_path, size
+        )
         try:
-            LOGGER.info("sync %sarchivo path=%s size=%sB", "completando " if resume_version else "subiendo ", rel_path, size)
-            version = self._upload_file_version(state, file_id, file_path, rel_path, size, mtime_ns, source_sha256, resume_version=resume_version)
-            
-            entry.update({"path": rel_path, "present": True, "size": size, "mtime_ns": mtime_ns, "source_sha256": source_sha256, "last_seen_at": utc_now_iso()})
-            existing_versions = entry.setdefault("versions", [])
-            existing_index = next((idx for idx, item in enumerate(existing_versions) if item.get("version_id") == version["version_id"]), None)
-            if existing_index is None:
-                existing_versions.append(version)
-            else:
-                existing_versions[existing_index] = version
-            entry["active_version_id"] = version["version_id"]
-            entry["last_verification"] = None
-            
-            if version.get("replication_complete", True):
-                entry["last_error"] = None
-                up_files += 1
-                self._record_uploaded_version(source_sha256, version)
-            else:
-                entry["last_error"] = version.get("copy_errors", [{}])[-1].get("error") if version.get("copy_errors") else "La version no se pudo replicar completamente."
-                fail_files += 1
-                
-            up_bytes += version["uploaded_bytes"]
-            LOGGER.info("sync archivo %s path=%s cuenta=%s repo=%s version=%s bytes=%s", "replicado" if version.get("replication_complete") else "parcial", rel_path, version["account_id"], version["repository"], version["version_id"], version["uploaded_bytes"])
-
+            version = self._upload_file_version(
+                state,
+                file_id,
+                file_path,
+                rel_path,
+                size,
+                mtime_ns,
+                source_sha256,
+                resume_version=resume_version,
+            )
         except NoAvailableAccountsError as exc:
-            # Antes se relanzaba y abortaba TODA la sincronización en cuanto un
-            # archivo no encontraba destino (p.ej. GitHub sin cupo diario y la
-            # copia en Telegram fallaba). Eso cancelaba el resto de la sync aun
-            # habiendo cuentas Telegram disponibles. Ahora lo tratamos como un
-            # fallo de archivo más: lo registramos y continuamos, de modo que el
-            # resto de archivos (y sus copias en Telegram) siguen intentándose.
-            entry.update({"path": rel_path, "present": True, "size": size, "mtime_ns": mtime_ns, "source_sha256": source_sha256, "last_seen_at": utc_now_iso(), "last_error": str(exc)})
-            fail_files += 1
-            self.state_manager.save(state)
+            # A file with nowhere to go is one failed file, not a failed run:
+            # aborting here used to cancel the whole sync even when other
+            # accounts or networks could still take the remaining files.
+            self._record_file_failure(file_id, rel_path, size, mtime_ns, source_sha256, str(exc), run)
+            counters["failed"] += 1
             LOGGER.error("sync sin destino para path=%s: %s", rel_path, exc)
-        except Exception as exc:
-            entry.update({"path": rel_path, "present": True, "size": size, "mtime_ns": mtime_ns, "source_sha256": source_sha256, "last_seen_at": utc_now_iso(), "last_error": str(exc)})
-            fail_files += 1
+            return
+        except Exception as exc:  # noqa: BLE001 - one bad file must not stop the run
+            self._record_file_failure(file_id, rel_path, size, mtime_ns, source_sha256, str(exc), run)
+            counters["failed"] += 1
             LOGGER.exception("sync error subiendo path=%s", rel_path)
+            return
 
-        flush_count += 1
-        if flush_count >= self._state_flush_every:
-            self.state_manager.save(state)
-            flush_count = 0
+        complete = bool(version.get("replication_complete", True))
+        copy_errors = version.get("copy_errors") or []
+        last_error = None
+        if not complete:
+            last_error = (
+                copy_errors[-1].get("error")
+                if copy_errors
+                else "La version no se pudo replicar completamente."
+            )
 
-        return up_files, fail_files, up_bytes, flush_count
-    
+        self.registry.save_version(
+            file_id,
+            version,
+            distinct_account_copies=distinct_account_copy_count(version),
+            storage=version_storage(version),
+        )
+        self.registry.upsert_file(
+            file_id=file_id,
+            rel_path=rel_path,
+            size=size,
+            mtime_ns=mtime_ns,
+            source_sha256=source_sha256,
+            version_id=version["version_id"],
+            status=STATUS_COMPLETE if complete else STATUS_ERROR,
+            present=True,
+            last_error=last_error,
+            seen_run=run,
+        )
+        # A new active version invalidates any verification of the old one.
+        self.registry.clear_verification(file_id)
+
+        if complete:
+            counters["uploaded"] += 1
+            self.registry.record_uploaded_version(source_sha256, version)
+        else:
+            counters["failed"] += 1
+        counters["uploaded_bytes"] += int(version.get("uploaded_bytes", 0))
+        LOGGER.info(
+            "sync archivo %s path=%s cuenta=%s repo=%s version=%s bytes=%s",
+            "replicado" if complete else "parcial",
+            rel_path,
+            version.get("account_id"),
+            version.get("repository"),
+            version["version_id"],
+            version.get("uploaded_bytes"),
+        )
+
+    def _record_file_failure(
+        self,
+        file_id: str,
+        rel_path: str,
+        size: int,
+        mtime_ns: int,
+        source_sha256: str,
+        error: str,
+        run: int,
+    ) -> None:
+        self.registry.upsert_file(
+            file_id=file_id,
+            rel_path=rel_path,
+            size=size,
+            mtime_ns=mtime_ns,
+            source_sha256=source_sha256,
+            status=STATUS_ERROR,
+            present=True,
+            last_error=error,
+            seen_run=run,
+        )
+
     def _verify_impl(self, state: dict[str, Any]) -> TaskResult:
+        """Check what is stored remotely. Never writes to /datos or to GitHub.
+
+        Two tiers, because a full re-download of everything is not affordable at
+        volume and a pure metadata check is not proof:
+
+        * metadata, every file — presence and size of each remote part. These
+          are reads, so they do not consume the content-generating budget.
+        * deep, 1 file in every ``VERIFY_DEEP_EVERY_N`` — download, per-part
+          sha256, and an AES-GCM close against the local hash. The selection
+          rotates on the run counter, so N=100 covers the whole set across 100
+          runs with no overlap, and N=1 checks everything on every run.
+
+        Results go only to the local registry.
+        """
         self._ensure_github_accounts_state(state)
-        files_state = state["files"]
+        run = self.registry.next_counter("verify_run")
+        deep_every_n = max(1, int(self.config.verify_deep_every_n))
+        remote_assets = self._remote_asset_index()
+
         verified = 0
         failures = 0
         copies_verified = 0
         copies_failed = 0
         copies_skipped = 0
+        deep_files = 0
 
-        for entry in files_state.values():
-            if not entry.get("present"):
-                continue
-            active_version = self._get_active_version(entry)
-            if not active_version:
+        for row in self.registry.iter_files(present_only=True):
+            version = self.registry.get_active_version(row.file_id)
+            if not version:
                 continue
 
-            local_path = self.config.app_data_dir / entry["path"]
+            local_path = self.config.app_data_dir / row.rel_path
             if not local_path.exists():
-                entry["present"] = False
-                entry["last_error"] = "Archivo ausente durante la verificacion."
+                self.registry.mark_missing(
+                    row.file_id, error="Archivo ausente durante la verificacion."
+                )
                 failures += 1
                 continue
 
-            local_sha = sha256_file(local_path)
-            version = self._normalize_version(active_version)
-            # Verify EVERY copy, not just the primary one: replication only buys
-            # durability if each copy is independently checked. Each copy is
-            # dispatched by its own network so the check works for GitHub today
-            # and additional backends (e.g. Telegram) as their clients are wired.
+            deep = (int(row.file_id, 16) % deep_every_n) == (run % deep_every_n)
+            if deep:
+                deep_files += 1
+            local_sha = sha256_file(local_path) if deep else None
+            version = self._normalize_version(version)
+
             copy_results: list[dict[str, Any]] = []
             for copy in version.get("copies", []):
                 try:
-                    detail = self._verify_copy(entry["path"], copy, local_sha)
+                    detail = self._verify_copy(
+                        row.rel_path, copy, local_sha, deep=deep, remote_assets=remote_assets
+                    )
                     copy_results.append(detail)
                     if detail.get("skipped"):
                         copies_skipped += 1
                     else:
                         copies_verified += 1
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - reported per copy
                     copy_results.append(
                         {
                             "ok": False,
@@ -473,15 +722,18 @@ class AppService:
                     copies_failed += 1
 
             ok_copies = [detail for detail in copy_results if detail.get("ok")]
-            failed_copies = [detail for detail in copy_results if not detail.get("ok") and not detail.get("skipped")]
-            # A file is verified only if no copy failed AND at least one copy was
-            # actually checked (a version we cannot verify at all is not "ok").
+            failed_copies = [
+                detail for detail in copy_results if not detail.get("ok") and not detail.get("skipped")
+            ]
+            # A file passes only if no copy failed AND at least one copy was
+            # actually checked: a version we cannot verify at all is not "ok".
             file_ok = not failed_copies and bool(ok_copies)
             primary = ok_copies[0] if ok_copies else (copy_results[0] if copy_results else {})
 
-            entry["last_verification"] = {
+            detail_payload = {
                 "checked_at": utc_now_iso(),
                 "ok": file_ok,
+                "depth": "deep" if deep else "metadata",
                 "local_sha256": local_sha,
                 "remote_sha256": primary.get("remote_sha256") if file_ok else None,
                 "version_id": version["version_id"],
@@ -494,15 +746,23 @@ class AppService:
                 "copies_failed": len(failed_copies),
                 "copies": copy_results,
             }
-            if file_ok:
-                entry["last_error"] = None
-                verified += 1
-            else:
-                entry["last_error"] = (
+            error = None
+            if not file_ok:
+                error = (
                     failed_copies[0].get("error")
                     if failed_copies
                     else "No se pudo verificar ninguna copia de la version."
                 )
+            self.registry.record_verification(
+                row.file_id,
+                ok=file_ok,
+                version_id=version["version_id"],
+                detail=detail_payload,
+                last_error=error,
+            )
+            if file_ok:
+                verified += 1
+            else:
                 failures += 1
 
         self.state_manager.save(state)
@@ -511,7 +771,9 @@ class AppService:
             {
                 "verified_files": verified,
                 "failed_files": failures,
-                "present_files": sum(1 for entry in files_state.values() if entry.get("present")),
+                "deep_checked_files": deep_files,
+                "deep_every_n": deep_every_n,
+                "present_files": self.registry.stats()["present"],
                 "copies_verified": copies_verified,
                 "copies_failed": copies_failed,
                 "copies_skipped": copies_skipped,
@@ -519,12 +781,30 @@ class AppService:
             None if failures == 0 else f"{failures} archivos con error",
         )
 
-    def _verify_copy(self, rel_path: str, copy: dict[str, Any], local_sha: str) -> dict[str, Any]:
+    def _remote_asset_index(self) -> dict[str, dict[str, int]]:
+        """Presence and size of every remote asset, one listing per release.
+
+        Empty while no data has been written through the Releases backend; the
+        commit-based layout has no equivalent cheap listing.
+        """
+        return {}
+
+    def _verify_copy(
+        self,
+        rel_path: str,
+        copy: dict[str, Any],
+        local_sha: str | None,
+        *,
+        deep: bool,
+        remote_assets: dict[str, dict[str, int]] | None = None,
+    ) -> dict[str, Any]:
         """Verify a single copy of a version against the local file hash.
 
-        Returns a detail dict. A copy on a network without a configured client
-        is reported as ``skipped`` (not failed) so GitHub-only deployments keep
-        passing while leaving a clear record that the copy was not checked.
+        Dispatch is by ``copy["storage"]``: ``"release"`` for data written
+        through the Releases backend, ``"blob"`` for the commit-based layout,
+        which stays readable. A copy on a network without a configured client is
+        reported as ``skipped`` (not failed), so GitHub-only deployments keep
+        passing while leaving a record that the copy was not checked.
         """
         network = copy.get("network", "github")
         copy_index = copy.get("copy_index")
@@ -539,8 +819,33 @@ class AppService:
                 "error": f"Verificacion no implementada para la red '{network}'.",
             }
 
-        account_id = copy.get("account_id")
-        client = self._client_for_account(account_id)
+        storage = copy.get("storage", STORAGE_BLOB)
+        if storage == STORAGE_RELEASE:
+            return self._verify_release_copy(
+                rel_path, copy, local_sha, deep=deep, remote_assets=remote_assets or {}
+            )
+        return self._verify_blob_copy(rel_path, copy, local_sha, deep=deep)
+
+    def _verify_blob_copy(
+        self, rel_path: str, copy: dict[str, Any], local_sha: str | None, *, deep: bool
+    ) -> dict[str, Any]:
+        copy_index = copy.get("copy_index")
+        if not deep or local_sha is None:
+            # The commit-based layout offers no cheap listing to check presence
+            # and size against, so an unselected legacy copy is not checked at
+            # all rather than reported as if it had been.
+            return {
+                "ok": False,
+                "skipped": True,
+                "copy_index": copy_index,
+                "network": "github",
+                "storage": STORAGE_BLOB,
+                "account_id": copy.get("account_id"),
+                "repository": copy.get("repository"),
+                "error": "Copia legacy no seleccionada para verificacion profunda en esta ronda.",
+            }
+
+        client = self._client_for_account(copy.get("account_id"))
         decryptor = StreamingAESGCMDecryptor(
             self.secrets.encryption_key_bytes(),
             copy["encryption"]["nonce_b64"],
@@ -560,165 +865,23 @@ class AppService:
         return {
             "ok": True,
             "copy_index": copy_index,
-            "network": network,
-            "account_id": account_id,
+            "network": "github",
+            "storage": STORAGE_BLOB,
+            "account_id": copy.get("account_id"),
             "repository": copy.get("repository"),
             "remote_sha256": remote_sha,
             "chunks_checked": downloaded_chunks,
         }
 
-    @staticmethod
-    def _can_trust_persisted_file_state(
-        entry: dict[str, Any] | None,
-        active_version: dict[str, Any] | None,
-    ) -> bool:
-        if not entry or not active_version:
-            return False
-        if not entry.get("present"):
-            return False
-        source_sha256 = entry.get("source_sha256")
-        if not source_sha256:
-            return False
-        if active_version.get("plaintext_sha256") != source_sha256:
-            return False
-        if not active_version.get("replication_complete", True):
-            return False
-        return True
-
-    def _apply_existing_version_entry(
-        self,
-        entry: dict[str, Any],
-        *,
-        rel_path: str,
-        size: int,
-        mtime_ns: int,
-        source_sha256: str,
-        version: dict[str, Any],
-    ) -> None:
-        version = self._normalize_version(version)
-        entry["path"] = rel_path
-        entry["present"] = True
-        entry["size"] = size
-        entry["mtime_ns"] = mtime_ns
-        entry["source_sha256"] = source_sha256
-        entry["last_seen_at"] = utc_now_iso()
-        entry.setdefault("versions", [])
-        if not any(item.get("version_id") == version.get("version_id") for item in entry["versions"]):
-            entry["versions"].append(version)
-        entry["active_version_id"] = version["version_id"]
-        entry["last_verification"] = None
-        entry["last_error"] = None
-
-    def _is_file_already_synced(
-        self,
-        entry: dict[str, Any] | None,
-        active_version: dict[str, Any] | None,
-        size: int,
-        mtime_ns: int,
-        *,
-        full: bool,
-    ) -> bool:
-        # A light (non-full) sync TRUSTS the persisted state: if we already hold a
-        # present, fully-replicated version for this file we skip it without
-        # re-hashing — and without re-uploading even if size/mtime changed on
-        # disk. Modifications are intentionally only picked up by a full sync,
-        # which forces a re-hash (returns False below). This keeps incremental
-        # syncs cheap and is the behaviour asserted by
-        # test_sync_trusts_persisted_version_until_full_sync.
-        if full:
-            return False
-        if not self._can_trust_persisted_file_state(entry, active_version):
-            return False
-        # Only "synced" once the requested number of copies (COPY_COUNT) has been
-        # made. An under-replicated version must fall through so sync can add the
-        # remaining copies on the next pass.
-        if not self._is_version_replication_complete(active_version):
-            return False
-        return True
-
-    @staticmethod
-    def distinct_account_copy_count(version: dict[str, Any] | None) -> int:
-        """Number of distinct accounts holding a copy of this version.
-
-        Two copies under the same account count as ONE — replication only buys
-        durability when copies live on different accounts/networks.
-        """
-        if not version:
-            return 0
-        seen: set[tuple[str, str]] = set()
-        for copy in version.get("copies", []):
-            account_id = copy.get("account_id")
-            if not account_id:
-                continue
-            seen.add((copy.get("network", "github"), account_id))
-        return len(seen)
-
     def _is_version_replication_complete(self, version: dict[str, Any] | None) -> bool:
         if not version:
             return False
         requested = int(version.get("copy_count_requested", self.config.copy_count))
-        return self.distinct_account_copy_count(version) >= requested
+        return distinct_account_copy_count(version) >= requested
 
-    @contextmanager
-    def _upload_index_connection(self):
-        self._upload_index_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self._upload_index_path, timeout=30)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS uploaded_versions (
-                    source_sha256 TEXT PRIMARY KEY,
-                    version_json TEXT NOT NULL,
-                    first_uploaded_at TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL,
-                    copy_count INTEGER NOT NULL DEFAULT 1
-                )
-                """
-            )
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
-
-    def _lookup_uploaded_version(self, source_sha256: str) -> dict[str, Any] | None:
-        with self._upload_index_connection() as conn:
-            row = conn.execute(
-                "SELECT version_json FROM uploaded_versions WHERE source_sha256 = ?",
-                (source_sha256,),
-            ).fetchone()
-        if not row:
-            return None
-        return self._normalize_version(json.loads(row[0]))
-
-    def _record_uploaded_version(self, source_sha256: str, version: dict[str, Any]) -> None:
-        payload = json.dumps(version, ensure_ascii=False)
-        now = utc_now_iso()
-        with self._upload_index_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO uploaded_versions (
-                    source_sha256, version_json, first_uploaded_at, last_seen_at, copy_count
-                ) VALUES (?, ?, ?, ?, 1)
-                ON CONFLICT(source_sha256) DO UPDATE SET
-                    version_json = excluded.version_json,
-                    last_seen_at = excluded.last_seen_at
-                """,
-                (source_sha256, payload, now, now),
-            )
-
-    def _mark_uploaded_copy_seen(self, source_sha256: str) -> None:
-        now = utc_now_iso()
-        with self._upload_index_connection() as conn:
-            conn.execute(
-                """
-                UPDATE uploaded_versions
-                SET last_seen_at = ?, copy_count = copy_count + 1
-                WHERE source_sha256 = ?
-                """,
-                (now, source_sha256),
-            )
+    @staticmethod
+    def distinct_account_copy_count(version: dict[str, Any] | None) -> int:
+        return distinct_account_copy_count(version)
 
     @staticmethod
     def _version_copies(version: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1631,15 +1794,6 @@ class AppService:
     @staticmethod
     def _today_bucket() -> str:
         return utc_now_iso().split("T", 1)[0]
-
-    @staticmethod
-    def _get_active_version(entry: dict[str, Any] | None) -> dict[str, Any] | None:
-        if not entry:
-            return None
-        active_version_id = entry.get("active_version_id")
-        if not active_version_id:
-            return None
-        return next((version for version in entry.get("versions", []) if version["version_id"] == active_version_id), None)
 
     def mark_manual_trigger(self, task_name: str) -> None:
         state = self.state_manager.load(self.default_config)

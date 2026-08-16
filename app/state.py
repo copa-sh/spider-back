@@ -117,6 +117,5 @@ class StateManager:
                     "running": False,
                 },
             },
-            "files": {},
             "github_accounts": {},
         }

@@ -191,6 +191,7 @@ def make_service(
     daily_limit_gb: float = 1,
     repo_limit_kb: int = 2048,
     copy_count: int = 1,
+    verify_deep_every_n: int = 1,
 ):
     data_dir = tmp_path / "datos"
     state_dir = tmp_path / "state"
@@ -202,6 +203,7 @@ def make_service(
         daily_limit_gb=daily_limit_gb,
         repo_limit_kb=repo_limit_kb,
         copy_count=copy_count,
+        verify_deep_every_n=verify_deep_every_n,
     )
 
 
@@ -212,6 +214,7 @@ def make_service_for_dirs(
     daily_limit_gb: float = 1,
     repo_limit_kb: int = 2048,
     copy_count: int = 1,
+    verify_deep_every_n: int = 1,
 ):
     config = AppConfig(
         github_accounts=(
@@ -239,6 +242,7 @@ def make_service_for_dirs(
         app_verify_interval_seconds=120,
         app_web_pin="12345678",
         app_encryption_key=None,
+        verify_deep_every_n=verify_deep_every_n,
     )
     secrets = RuntimeSecrets(
         encryption_key="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
@@ -264,6 +268,17 @@ def make_service_for_dirs(
     return service, data_dir, sampled_sleeps
 
 
+def only_file(service):
+    """The single registry row, for tests that sync exactly one file."""
+    rows = service.registry.list_files(limit=10)
+    assert len(rows) == 1
+    return rows[0]
+
+
+def active_version(service, file_id: str):
+    return service.registry.get_active_version(file_id)
+
+
 def test_sync_verify_and_repo_metadata_are_persisted(tmp_path):
     service, data_dir, sampled_sleeps = make_service(tmp_path)
     sample = data_dir / "archivo.txt"
@@ -273,8 +288,8 @@ def test_sync_verify_and_repo_metadata_are_persisted(tmp_path):
     assert sync.ok is True
 
     state = service.get_state()
-    file_id, entry = next(iter(state["files"].items()))
-    version = entry["versions"][0]
+    row = only_file(service)
+    version = active_version(service, row.file_id)
     assert version["account_id"] == "account_1"
     assert version["repository"] == "model-0001"
     assert version["replication_complete"] is True
@@ -287,9 +302,9 @@ def test_sync_verify_and_repo_metadata_are_persisted(tmp_path):
 
     verify = service.run_verify()
     assert verify.ok is True
-    state = service.get_state()
-    assert state["files"][file_id]["last_verification"]["account_id"] == "account_1"
-    assert state["files"][file_id]["last_verification"]["remote_sha256"] == state["files"][file_id]["source_sha256"]
+    detail = service.get_file_detail(row.file_id)
+    assert detail["last_verification"]["account_id"] == "account_1"
+    assert detail["last_verification"]["remote_sha256"] == detail["source_sha256"]
 
 
 def test_sync_can_create_multiple_copies_in_distinct_accounts(tmp_path):
@@ -300,8 +315,7 @@ def test_sync_can_create_multiple_copies_in_distinct_accounts(tmp_path):
     sync = service.run_sync()
     assert sync.ok is True
 
-    state = service.get_state()
-    version = next(iter(state["files"].values()))["versions"][0]
+    version = active_version(service, only_file(service).file_id)
     assert version["copy_count_requested"] == 2
     assert version["copy_count_completed"] == 2
     assert version["replication_complete"] is True
@@ -321,8 +335,7 @@ def test_verify_checks_every_copy(tmp_path):
     assert verify.summary["copies_verified"] == 2
     assert verify.summary["copies_failed"] == 0
 
-    state = service.get_state()
-    last_verification = next(iter(state["files"].values()))["last_verification"]
+    last_verification = service.get_file_detail(only_file(service).file_id)["last_verification"]
     assert last_verification["ok"] is True
     assert last_verification["copies_total"] == 2
     assert last_verification["copies_verified"] == 2
@@ -335,8 +348,7 @@ def test_verify_detects_corrupted_secondary_copy(tmp_path):
 
     # Corrupt the chunks of the SECOND copy only. The legacy verify (primary
     # copy only) would have missed this; the copy-aware verify must catch it.
-    state = service.state_manager.load(service.default_config)
-    version = next(iter(state["files"].values()))["versions"][0]
+    version = active_version(service, only_file(service).file_id)
     second_copy = version["copies"][1]
     corrupt_client = service.github_clients[second_copy["account_id"]]
     for chunk in second_copy["chunks"]:
@@ -386,11 +398,9 @@ def test_sync_reuses_already_uploaded_copy_via_sqlite(tmp_path):
     assert sync.summary["uploaded_files"] == 1
     assert sync.summary["reused_files"] == 1
 
-    state = service.get_state()
-    entries = list(state["files"].values())
-    assert len(entries) == 2
-    active_versions = {entry["active_version_id"] for entry in entries}
-    assert len(active_versions) == 1
+    rows = service.registry.list_files(limit=10)
+    assert len(rows) == 2
+    assert len({row.version_id for row in rows}) == 1
 
 
 def test_sync_reuses_already_uploaded_copy_after_restart_via_sqlite(tmp_path):
@@ -411,41 +421,97 @@ def test_sync_reuses_already_uploaded_copy_after_restart_via_sqlite(tmp_path):
     assert sync.summary["uploaded_files"] == 0
     assert sync.summary["reused_files"] == 1
 
-    state = restarted_service.get_state()
-    assert len(state["files"]) == 2
+    assert restarted_service.registry.count_files() == 2
 
 
-def test_sync_trusts_persisted_version_until_full_sync(tmp_path):
+def test_sync_detects_modifications_without_a_full_mode(tmp_path):
+    """There is no full mode any more: the single sync must notice a changed
+    file by itself, via (size, mtime_ns), and upload a new version."""
     service, data_dir, _ = make_service(tmp_path)
     sample = data_dir / "archivo.txt"
     sample.write_text("version inicial", encoding="utf-8")
 
-    first_sync = service.run_sync()
-    assert first_sync.ok is True
+    assert service.run_sync().ok is True
 
-    original_state = service.get_state()
-    file_id, entry = next(iter(original_state["files"].items()))
-    original_version_id = entry["active_version_id"]
-    original_sha = entry["source_sha256"]
+    row = only_file(service)
+    original_version_id = row.version_id
+    original_sha = row.source_sha256
 
-    sample.write_text("version modificada", encoding="utf-8")
+    sample.write_text("version modificada y mas larga", encoding="utf-8")
 
-    light_sync = service.run_sync()
-    assert light_sync.ok is True
-    assert light_sync.summary["uploaded_files"] == 0
+    second = service.run_sync()
+    assert second.ok is True
+    assert second.summary["uploaded_files"] == 1
 
-    light_state = service.get_state()
-    assert light_state["files"][file_id]["active_version_id"] == original_version_id
-    assert light_state["files"][file_id]["source_sha256"] == original_sha
+    updated = only_file(service)
+    assert updated.version_id != original_version_id
+    assert updated.source_sha256 != original_sha
+    assert len(service.registry.list_versions(updated.file_id)) == 2
 
-    full_sync = service.run_full_sync()
-    assert full_sync.ok is True
-    assert full_sync.summary["uploaded_files"] == 1
 
-    full_state = service.get_state()
-    assert full_state["files"][file_id]["active_version_id"] != original_version_id
-    assert full_state["files"][file_id]["source_sha256"] != original_sha
-    assert len(full_state["files"][file_id]["versions"]) == 2
+def test_unchanged_file_is_never_hashed(tmp_path, monkeypatch):
+    """The fast path must skip on (size, mtime_ns) alone — no hashing, and no
+    reading of the file at all."""
+    service, data_dir, _ = make_service(tmp_path)
+    (data_dir / "archivo.txt").write_text("contenido estable", encoding="utf-8")
+    assert service.run_sync().ok is True
+
+    def fail_if_hashed(path, chunk_size: int = 1024 * 1024):
+        raise AssertionError(f"sha256_file no deberia ejecutarse para {path}")
+
+    monkeypatch.setattr("app.service.sha256_file", fail_if_hashed)
+
+    second = service.run_sync()
+    assert second.ok is True
+    assert second.summary["scanned_files"] == 1
+    assert second.summary["unchanged_files"] == 1
+    assert second.summary["uploaded_files"] == 0
+
+
+def test_metadata_only_change_does_not_reupload(tmp_path):
+    """Same bytes, new size/mtime metadata: the hash settles it, so the file is
+    re-hashed but not re-uploaded."""
+    service, data_dir, _ = make_service(tmp_path)
+    sample = data_dir / "archivo.txt"
+    sample.write_text("contenido identico", encoding="utf-8")
+    assert service.run_sync().ok is True
+
+    original = only_file(service)
+    client = service.github_clients["account_1"]
+    commits_before = len(client.commits)
+
+    # Rewrite byte-identical content: mtime moves, content does not.
+    sample.write_text("contenido identico", encoding="utf-8")
+    import os
+
+    os.utime(sample, ns=(original.mtime_ns + 10**9, original.mtime_ns + 10**9))
+
+    second = service.run_sync()
+    assert second.ok is True
+    assert second.summary["uploaded_files"] == 0
+    assert second.summary["metadata_only_files"] == 1
+    assert len(client.commits) == commits_before
+
+    updated = only_file(service)
+    assert updated.version_id == original.version_id
+    assert updated.mtime_ns != original.mtime_ns
+
+
+def test_deleted_files_are_marked_absent_only_after_the_walk(tmp_path):
+    service, data_dir, _ = make_service(tmp_path)
+    (data_dir / "a.txt").write_text("a", encoding="utf-8")
+    (data_dir / "b.txt").write_text("b", encoding="utf-8")
+    assert service.run_sync().ok is True
+    assert service.get_stats()["absent"] == 0
+
+    (data_dir / "b.txt").unlink()
+
+    # A second run inside the same wall-clock second must still notice: absence
+    # is keyed on the run counter, not on a one-second-resolution timestamp.
+    second = service.run_sync()
+    assert second.ok is True
+    assert second.summary["missing_files"] == 1
+    assert service.get_stats()["absent"] == 1
 
 
 def test_creates_new_repository_when_existing_one_is_full(tmp_path):
@@ -457,8 +523,7 @@ def test_creates_new_repository_when_existing_one_is_full(tmp_path):
     sync = service.run_sync()
     assert sync.ok is True
 
-    state = service.get_state()
-    version = next(iter(state["files"].values()))["versions"][0]
+    version = active_version(service, only_file(service).file_id)
     assert version["repository"] == "model-0002"
 
 
@@ -480,8 +545,7 @@ def test_uses_second_account_when_first_reaches_daily_limit(tmp_path):
 
     sync = service.run_sync()
     assert sync.ok is True
-    saved = service.get_state()
-    version = next(iter(saved["files"].values()))["versions"][0]
+    version = active_version(service, only_file(service).file_id)
     assert version["account_id"] == "account_2"
 
 
@@ -499,7 +563,7 @@ def test_reports_actionable_error_when_token_cannot_create_repository(tmp_path):
 
     assert sync.ok is True
     state = service.get_state()
-    version = next(iter(state["files"].values()))["versions"][0]
+    version = active_version(service, only_file(service).file_id)
     assert version["account_id"] == "account_2"
     assert second_client.created_repositories == ["model-0001"]
     account_1_state = state["github_accounts"]["account_1"]
@@ -517,11 +581,11 @@ def test_removes_account_from_active_pool_when_pat_cannot_access_repositories(tm
     )
     (data_dir / "archivo.txt").write_text("hola", encoding="utf-8")
 
-    sync = service.run_full_sync()
+    sync = service.run_sync()
 
     assert sync.ok is True
     state = service.get_state()
-    version = next(iter(state["files"].values()))["versions"][0]
+    version = active_version(service, only_file(service).file_id)
     assert version["account_id"] == "account_2"
     assert fallback_client.created_repositories == ["model-0001"]
     account_1_state = state["github_accounts"]["account_1"]
@@ -564,8 +628,7 @@ def test_fails_when_all_accounts_are_over_daily_limit(tmp_path):
     assert sync.summary["scanned_files"] == 1
 
     # El motivo real queda registrado en el archivo y menciona el cupo de GitHub.
-    state_after = service.state_manager.load(service.default_config)
-    file_errors = [entry.get("last_error") for entry in state_after["files"].values()]
+    file_errors = [row.last_error for row in service.registry.iter_files()]
     assert any(err and "cupo diario" in err for err in file_errors)
 
 
@@ -591,8 +654,8 @@ def test_web_login_and_manual_actions(tmp_path):
     trigger = client.post("/actions/verify")
     assert trigger.status_code == 302
 
-    full_sync_trigger = client.post("/actions/full-sync")
-    assert full_sync_trigger.status_code == 302
+    # Three operations became two: the full-sync endpoint is gone.
+    assert client.post("/actions/full-sync").status_code == 404
 
 
 def test_home_shows_github_account_alerts_table(tmp_path):
@@ -655,69 +718,39 @@ def test_new_version_invalidates_prior_verification(tmp_path):
     assert service.run_sync().ok is True
     assert service.run_verify().ok is True
 
-    state = service.get_state()
-    file_id = next(iter(state["files"].keys()))
-    assert state["files"][file_id]["last_verification"]["ok"] is True
-    v1_id = state["files"][file_id]["active_version_id"]
-    assert state["files"][file_id]["last_verification"]["version_id"] == v1_id
+    row = only_file(service)
+    v1_id = row.version_id
+    detail = service.get_file_detail(row.file_id)
+    assert detail["last_verification"]["ok"] is True
+    assert detail["last_verification"]["version_id"] == v1_id
 
     sample.write_text("v2 longer contents", encoding="utf-8")
-    assert service.run_full_sync().ok is True
+    assert service.run_sync().ok is True
 
-    state = service.get_state()
-    entry = state["files"][file_id]
-    assert entry["active_version_id"] != v1_id
-    assert entry["last_verification"] is None
+    updated = only_file(service)
+    assert updated.version_id != v1_id
+    assert service.get_file_detail(updated.file_id)["last_verification"] is None
 
 
 def test_home_verified_count_requires_version_match(tmp_path):
-    """The home-page 'verified' tile must only count files whose stored
-    verification is for the current active_version_id."""
+    """The 'verified' tile must only count files whose stored verification is
+    for the current active version."""
     service, data_dir, _ = make_service(tmp_path)
-    sample = data_dir / "archivo.txt"
-    sample.write_text("v1", encoding="utf-8")
+    (data_dir / "archivo.txt").write_text("v1", encoding="utf-8")
 
     assert service.run_sync().ok is True
     assert service.run_verify().ok is True
+    assert service.get_stats()["verified"] == 1
 
-    app = create_web_app(service)
-    client = app.test_client()
-    client.post("/login", data={"pin": "12345678"})
+    # Fabricate the stale condition: bump the active version without clearing
+    # the verification (state that could pre-exist the fix).
+    row = only_file(service)
+    service.registry._execute(
+        "UPDATE files SET version_id = ? WHERE file_id = ?",
+        ("different-version-id", row.file_id),
+    )
 
-    response = client.get("/")
-    assert response.status_code == 200
-    assert b"verified" in response.data.lower() or b"verificad" in response.data.lower()
-
-    # Now manually fabricate the bug condition: bump active_version_id without
-    # clearing last_verification (simulates state that pre-existed the fix or
-    # was created by a code path the fix doesn't cover).
-    state = service.state_manager.load(service.default_config)
-    file_id = next(iter(state["files"].keys()))
-    state["files"][file_id]["active_version_id"] = "different-version-id"
-    service.state_manager.save(state)
-
-    from app.web import HOME_TEMPLATE  # noqa: F401  (sanity import)
-
-    with app.test_request_context("/"):
-        # Re-fetch via the route to exercise the count.
-        response = client.get("/")
-        assert response.status_code == 200
-        # Verified count should be 0 because the stale verification points at
-        # the old version_id, not the current active_version_id.
-        body = response.data.decode("utf-8")
-        # Look for "verified" stat == 0; template format may vary, so just
-        # assert the file is no longer counted as verified by checking that
-        # the stat appears with a 0 near it.
-        # We use a loose check: the stats dict computed by the route should
-        # have verified == 0 — re-derive from state to confirm the logic.
-        files = state["files"].values()
-        verified = sum(
-            1
-            for item in files
-            if (item.get("last_verification") or {}).get("ok") is True
-            and (item.get("last_verification") or {}).get("version_id") == item.get("active_version_id")
-        )
-        assert verified == 0
+    assert service.get_stats()["verified"] == 0
 
 
 def test_file_detail_labels_source_sha_as_upload_time(tmp_path):
@@ -728,8 +761,7 @@ def test_file_detail_labels_source_sha_as_upload_time(tmp_path):
     sample.write_text("contenido", encoding="utf-8")
     assert service.run_sync().ok is True
 
-    state = service.get_state()
-    file_id = next(iter(state["files"].keys()))
+    file_id = only_file(service).file_id
 
     app = create_web_app(service)
     client = app.test_client()
@@ -749,8 +781,7 @@ def test_sync_places_copy_on_each_network(tmp_path):
     sync = service.run_sync()
     assert sync.ok is True
 
-    state = service.get_state()
-    version = next(iter(state["files"].values()))["versions"][0]
+    version = active_version(service, only_file(service).file_id)
     assert version["copy_count_requested"] == 2
     assert version["copy_count_completed"] == 2
     assert version["replication_complete"] is True
@@ -785,8 +816,7 @@ def test_sync_falls_back_to_telegram_when_github_quota_exhausted(tmp_path):
 
     service.run_sync()
 
-    state = service.get_state()
-    version = next(iter(state["files"].values()))["versions"][0]
+    version = active_version(service, only_file(service).file_id)
     networks = {copy["network"] for copy in version["copies"]}
     assert "telegram" in networks
     assert "github" not in networks
@@ -816,10 +846,9 @@ def test_unplaceable_file_does_not_abort_whole_sync(tmp_path):
     assert sync.summary["scanned_files"] == 1
     assert sync.summary["failed_files"] == 1
 
-    state = service.get_state()
-    file_entry = next(iter(state["files"].values()))
-    assert file_entry["last_error"]
-    assert "telegram" in file_entry["last_error"].lower()
+    row = only_file(service)
+    assert row.last_error
+    assert "telegram" in row.last_error.lower()
 
 
 def test_verify_skips_telegram_copy_but_passes_github(tmp_path):
@@ -834,6 +863,109 @@ def test_verify_skips_telegram_copy_but_passes_github(tmp_path):
     assert verify.summary["copies_skipped"] == 1
     assert verify.summary["copies_failed"] == 0
 
-    state = service.get_state()
-    file_entry = next(iter(state["files"].values()))
-    assert file_entry["last_verification"]["ok"] is True
+    detail = service.get_file_detail(only_file(service).file_id)
+    assert detail["last_verification"]["ok"] is True
+
+
+def test_verify_with_n_1_checks_every_file(tmp_path):
+    service, data_dir, _ = make_service(tmp_path, verify_deep_every_n=1)
+    for index in range(6):
+        (data_dir / f"archivo{index}.txt").write_text(f"contenido {index}", encoding="utf-8")
+    assert service.run_sync().ok is True
+
+    verify = service.run_verify()
+    assert verify.ok is True
+    assert verify.summary["deep_checked_files"] == 6
+    assert verify.summary["verified_files"] == 6
+
+
+def test_verify_with_n_3_covers_every_file_across_three_runs_without_repeats(tmp_path):
+    """Rotating selection: N runs must cover the whole set exactly once each."""
+    service, data_dir, _ = make_service(tmp_path, verify_deep_every_n=3)
+    for index in range(9):
+        (data_dir / f"archivo{index}.txt").write_text(f"contenido {index}", encoding="utf-8")
+    assert service.run_sync().ok is True
+
+    seen: list[set[str]] = []
+    for _ in range(3):
+        service.run_verify()
+        deep = {
+            row.file_id
+            for row in service.registry.iter_files()
+            if (service.registry.verification_detail(row.file_id) or {}).get("depth") == "deep"
+            and service.registry.verification_detail(row.file_id)["checked_at"] is not None
+        }
+        seen.append(deep)
+
+    all_ids = {row.file_id for row in service.registry.iter_files()}
+    # Every file is deep-checked at some point across the three runs...
+    assert set().union(*seen) == all_ids
+    # ...and each run picks a disjoint slice, so nothing is checked twice.
+    counts = [len(run) for run in seen]
+    assert sum(counts) == len(all_ids)
+
+
+def test_legacy_index_json_files_are_imported_into_the_registry(tmp_path):
+    """A state dir written by the previous version must come up with its file
+    map intact — and index.json must stop carrying it."""
+    import json
+
+    data_dir = tmp_path / "datos"
+    state_dir = tmp_path / "state"
+    data_dir.mkdir()
+    state_dir.mkdir()
+    (data_dir / "archivo.txt").write_text("contenido", encoding="utf-8")
+
+    legacy_version = {
+        "version_id": "20260101T000000000000Z",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "network": "github",
+        "account_id": "account_1",
+        "repository_owner": "owner-a",
+        "repository": "model-0001",
+        "branch": "main",
+        "plaintext_sha256": "deadbeef",
+        "chunks": [],
+        "encryption": {"nonce_b64": "AAAAAAAAAAAAAAAA", "algorithm": "AES-256-GCM"},
+    }
+    (state_dir / "index.json").write_text(
+        json.dumps(
+            {
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "config": {},
+                "tasks": {},
+                "github_accounts": {},
+                "files": {
+                    "abc0123456789def": {
+                        "file_id": "abc0123456789def",
+                        "path": "archivo.txt",
+                        "size": 9,
+                        "mtime_ns": 123,
+                        "source_sha256": "deadbeef",
+                        "present": True,
+                        "active_version_id": "20260101T000000000000Z",
+                        "versions": [legacy_version],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    service, _, _ = make_service_for_dirs(data_dir, state_dir)
+
+    row = service.registry.get_file("abc0123456789def")
+    assert row is not None
+    assert row.rel_path == "archivo.txt"
+    assert row.source_sha256 == "deadbeef"
+    assert row.version_id == "20260101T000000000000Z"
+    # The commit-based version stays readable, so it remains verifiable.
+    assert service.registry.get_active_version(row.file_id)["repository"] == "model-0001"
+
+    persisted = json.loads((state_dir / "index.json").read_text(encoding="utf-8"))
+    assert "files" not in persisted
+    assert "tasks" in persisted
+
+    # Idempotent: a second boot must not re-import or crash.
+    again, _, _ = make_service_for_dirs(data_dir, state_dir)
+    assert again.registry.count_files() == 1
