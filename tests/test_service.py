@@ -280,7 +280,9 @@ def test_sync_verify_and_repo_metadata_are_persisted(tmp_path):
     assert version["replication_complete"] is True
     assert len(version["copies"]) == 1
     assert state["github_accounts"]["account_1"]["repositories"]["model-0001"]["last_known_size_kb"] >= 1
-    assert sampled_sleeps
+    # The GitHub path no longer sleeps between uploads: pacing is the
+    # RateLimiter's job, and the fixed per-blob sleep was pure dead time.
+    assert sampled_sleeps == []
     assert ("model-0001", "main") in service.github_clients["account_1"].initialized_branches
 
     verify = service.run_verify()

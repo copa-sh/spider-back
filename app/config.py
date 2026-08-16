@@ -17,6 +17,11 @@ DEFAULT_CHUNK_SIZE_MB = 24
 DEFAULT_COPY_COUNT = 1
 DEFAULT_INTERVAL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_REPOSITORY_PREFIX = "model"
+# Under GitHub's documented secondary limits (500/hour, 80/minute) so there is
+# headroom for requests issued outside our limiter. See app/rate_limit.py.
+DEFAULT_CONTENT_REQUESTS_PER_HOUR = 450
+DEFAULT_CONTENT_REQUESTS_PER_MINUTE = 70
+DEFAULT_MAX_CONCURRENCY = 3
 
 
 class ConfigError(Exception):
@@ -146,6 +151,11 @@ class AppConfig:
     tg_timeout_seconds: int = 900
     tg_max_retry: int = DEFAULT_MAX_RETRY
     tg_backoff_seconds: int = DEFAULT_BACKOFF_SECONDS
+    # Proactive request budget. The scarce GitHub resource is content-generating
+    # requests, not bytes, so these are the knobs that decide throughput.
+    github_content_requests_per_hour: int = DEFAULT_CONTENT_REQUESTS_PER_HOUR
+    github_content_requests_per_minute: int = DEFAULT_CONTENT_REQUESTS_PER_MINUTE
+    github_max_concurrency: int = DEFAULT_MAX_CONCURRENCY
 
     @property
     def github_chunk_size_bytes(self) -> int:
@@ -304,6 +314,13 @@ def load_config() -> AppConfig:
         tg_timeout_seconds=tg_timeout_seconds,
         tg_max_retry=tg_max_retry,
         tg_backoff_seconds=tg_backoff_seconds,
+        github_content_requests_per_hour=_env_int(
+            "GITHUB_CONTENT_REQUESTS_PER_HOUR", DEFAULT_CONTENT_REQUESTS_PER_HOUR
+        ),
+        github_content_requests_per_minute=_env_int(
+            "GITHUB_CONTENT_REQUESTS_PER_MINUTE", DEFAULT_CONTENT_REQUESTS_PER_MINUTE
+        ),
+        github_max_concurrency=_env_int("GITHUB_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY),
     )
 
     config.app_state_dir.mkdir(parents=True, exist_ok=True)

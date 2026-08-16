@@ -105,6 +105,9 @@ class AppService:
                     timeout_s=config.github_timeout_seconds,
                     max_retry=config.github_max_retry,
                     backoff_s=config.github_backoff_seconds,
+                    content_requests_per_hour=config.github_content_requests_per_hour,
+                    content_requests_per_minute=config.github_content_requests_per_minute,
+                    max_concurrency=config.github_max_concurrency,
                 )
             )
             for account in config.github_accounts
@@ -192,8 +195,10 @@ class AppService:
                 with self._live_state_lock:
                     self._live_state = state
 
+                self._reset_rate_limit_stats()
                 try:
                     result = callback(state)
+                    self._log_rate_limit_summary(task_name)
 
                     state["tasks"][task_name]["running"] = False
                     state["tasks"][task_name]["last_finished_at"] = utc_now_iso()
@@ -827,7 +832,6 @@ class AppService:
                 target.repository,
             )
             chunk_sha = client.create_blob(target.owner, target.repository, chunk)
-            self._sleep_after_upload()
             chunk_path = f"{remote_prefix}/chunk_{chunk_index:04d}.bin"
             tree_entries.append({"path": chunk_path, "mode": "100644", "type": "blob", "sha": chunk_sha})
             chunks_payload.append(
@@ -927,7 +931,6 @@ class AppService:
                 target.repository,
             )
             manifest_sha = client.create_blob(target.owner, target.repository, manifest_bytes)
-            self._sleep_after_upload()
             remote_prefix = f"{self.config.github_uploads_prefix}/{file_id}/{version_id}"
             manifest_path = f"{remote_prefix}/manifest.json"
             tree_entries.append({"path": manifest_path, "mode": "100644", "type": "blob", "sha": manifest_sha})
@@ -1455,6 +1458,13 @@ class AppService:
         return 2048 + len(rel_path.encode("utf-8")) + chunk_count * 512
 
     def _sleep_after_upload(self) -> None:
+        """Artificial throttle, kept only for the Telegram path.
+
+        GitHub uploads no longer sleep here: pacing is now the RateLimiter's job
+        (a proactive token bucket), and a fixed per-blob sleep only added dead
+        time — ~1.8s per small file with the documented 0.25-1.5s range, on top
+        of a budget that is already the binding constraint.
+        """
         if self.config.github_upload_sleep_max_seconds <= 0:
             return
         duration = self._sleep_sampler(
@@ -1463,6 +1473,26 @@ class AppService:
         )
         if duration > 0:
             self._sleeper(duration)
+
+    def _reset_rate_limit_stats(self) -> None:
+        for client in self.github_clients.values():
+            limiter = getattr(client, "rate_limiter", None)
+            if limiter is not None:
+                limiter.reset_stats()
+
+    def _log_rate_limit_summary(self, task_name: str) -> None:
+        """Per-run consumption report.
+
+        GitHub does not document whether uploads to uploads.github.com count
+        against the content-generating budget, so the budget has to be tuned
+        against measured numbers rather than assumed ones. This is that
+        measurement.
+        """
+        for account_id, client in self.github_clients.items():
+            summary = getattr(client, "rate_limit_summary", None)
+            if summary is None:
+                continue
+            LOGGER.info("%s rate-limit resumen cuenta=%s %s", task_name, account_id, summary())
 
     def _client_for_account(self, account_id: str) -> GitHubClient:
         client = self.github_clients.get(account_id)
