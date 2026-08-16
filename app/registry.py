@@ -84,7 +84,7 @@ SCHEMA_STATEMENTS = (
     """,
     """
     CREATE TABLE IF NOT EXISTS assets (
-        name TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
         file_id TEXT NOT NULL,
         version_id TEXT NOT NULL,
         part INTEGER NOT NULL,
@@ -93,7 +93,11 @@ SCHEMA_STATEMENTS = (
         github_asset_id INTEGER,
         size INTEGER,
         sha256 TEXT,
-        uploaded_at TEXT
+        uploaded_at TEXT,
+        -- Keyed on (release_tag, name), not name alone: with COPY_COUNT > 1 the
+        -- same deterministic part name exists once per account, and collapsing
+        -- them would let one copy adopt another account's asset.
+        PRIMARY KEY (release_tag, name)
     )
     """,
     """
@@ -556,12 +560,11 @@ class Registry:
                 name, file_id, version_id, part, parts, release_tag,
                 github_asset_id, size, sha256, uploaded_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
+            ON CONFLICT(release_tag, name) DO UPDATE SET
                 file_id = excluded.file_id,
                 version_id = excluded.version_id,
                 part = excluded.part,
                 parts = excluded.parts,
-                release_tag = excluded.release_tag,
                 github_asset_id = excluded.github_asset_id,
                 size = excluded.size,
                 sha256 = excluded.sha256,
@@ -581,8 +584,30 @@ class Registry:
             ),
         )
 
-    def get_asset(self, name: str) -> AssetRow | None:
-        row = self.connection.execute("SELECT * FROM assets WHERE name = ?", (name,)).fetchone()
+    def get_asset(self, release_tag: str, name: str) -> AssetRow | None:
+        row = self.connection.execute(
+            "SELECT * FROM assets WHERE release_tag = ? AND name = ?", (release_tag, name)
+        ).fetchone()
+        return _asset_row(row) if row else None
+
+    def find_account_asset(
+        self, *, file_id: str, version_id: str, part: int, account_id: str
+    ) -> AssetRow | None:
+        """The part already uploaded for THIS account, if any.
+
+        Scoped by account because every copy of a version uses the same
+        deterministic asset name; only the release it lives in distinguishes them.
+        """
+        row = self.connection.execute(
+            """
+            SELECT assets.* FROM assets
+            JOIN releases ON releases.tag = assets.release_tag
+            WHERE assets.file_id = ? AND assets.version_id = ? AND assets.part = ?
+              AND releases.account_id = ?
+            LIMIT 1
+            """,
+            (file_id, version_id, int(part), account_id),
+        ).fetchone()
         return _asset_row(row) if row else None
 
     def assets_for_version(self, file_id: str, version_id: str) -> list[AssetRow]:
@@ -598,8 +623,10 @@ class Registry:
         ).fetchall()
         return [_asset_row(row) for row in rows]
 
-    def delete_asset(self, name: str) -> None:
-        self._execute("DELETE FROM assets WHERE name = ?", (name,))
+    def delete_asset(self, release_tag: str, name: str) -> None:
+        self._execute(
+            "DELETE FROM assets WHERE release_tag = ? AND name = ?", (release_tag, name)
+        )
 
     # ── releases ────────────────────────────────────────────────────────────
 

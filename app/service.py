@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import fcntl
-import base64
+import hashlib
 import json
 import logging
 import math
+import os
 import random
+import tempfile
 import threading
 import time
 from copy import deepcopy
@@ -14,15 +16,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-try:
-    import pysqlite3 as sqlite3
-except ImportError:  # pragma: no cover - fallback for local environments
-    import sqlite3
-
+from .asset_format import (
+    HEADER_RESERVED,
+    PREFIX_SIZE,
+    asset_name,
+    iter_decrypted_part,
+    write_part,
+)
 from .config import AppConfig, GitHubAccountConfig, TelegramAccountConfig, RuntimeSecrets
-from .crypto import StreamingAESGCMDecryptor, chunk_bytes, encrypt_bytes, encrypt_bytes_with_nonce
+from .crypto import StreamingAESGCMDecryptor, chunk_bytes, encrypt_bytes
 from .github_api import GitHubClient, GitHubError, GitHubSettings, RepositoryInfo
 from .registry import (
+    RELEASE_ASSET_LIMIT,
     STATUS_COMPLETE,
     STATUS_ERROR,
     STATUS_UPLOADING,
@@ -50,6 +55,12 @@ LOGGER = logging.getLogger("spider-back")
 
 LEGACY_IMPORT_FLAG = "index_json_files_migrated"
 
+# One consolidated manifest per release, not per file: a per-file manifest would
+# cost a second content-generating request per file and cancel out half the gain.
+MANIFEST_ASSET_NAME = "manifest.spdr"
+
+GCM_TAG_BYTES = 16
+
 
 class ServiceError(Exception):
     pass
@@ -67,12 +78,14 @@ class TaskResult:
 
 
 @dataclass(frozen=True)
-class UploadTarget:
+class ReleaseTarget:
+    """An open release with room for more assets."""
+
     account_id: str
     owner: str
     repository: str
-    branch: str
-    repository_private: bool
+    tag: str
+    release_id: int
 
 
 class AppService:
@@ -156,6 +169,10 @@ class AppService:
         # live in-memory state while a task is running (used by web UI to reflect progress)
         self._live_state: dict[str, Any] | None = None
         self._live_state_lock = threading.RLock()
+        # Release bookkeeping, resolved once per process instead of per file.
+        self._release_repositories: dict[str, str] = {}
+        self._remote_assets: dict[str, dict[str, Any]] = {}
+        self._releases_touched: set[str] = set()
         self._import_legacy_file_map()
 
     def _import_legacy_file_map(self) -> None:
@@ -433,6 +450,16 @@ class AppService:
                     resume_version = existing
 
             # 4. New content, or a version whose replication has to be finished.
+            #    Reuse the version id of an interrupted attempt on the same
+            #    content: asset names are derived from it, so matching names are
+            #    what let the next run reconcile the parts already uploaded
+            #    instead of orphaning them under a fresh id.
+            resume_version_id = None
+            if resume_version is not None:
+                resume_version_id = resume_version["version_id"]
+            elif row is not None and row.source_sha256 == source_sha256 and row.version_id:
+                resume_version_id = row.version_id
+
             self._process_upload(
                 state,
                 file_id=file_id,
@@ -442,6 +469,7 @@ class AppService:
                 mtime_ns=mtime_ns,
                 source_sha256=source_sha256,
                 resume_version=resume_version,
+                resume_version_id=resume_version_id,
                 run=run,
                 counters=counters,
             )
@@ -538,17 +566,21 @@ class AppService:
         mtime_ns: int,
         source_sha256: str,
         resume_version: dict[str, Any] | None,
+        resume_version_id: str | None,
         run: int,
         counters: dict[str, int],
     ) -> None:
-        # Written before the upload starts so an interrupted run leaves an
-        # `uploading` row the next sync can reconcile against the remote.
+        version_id = resume_version_id or utc_now_compact()
+        # Written before the upload starts, version id included: an interrupted
+        # run then leaves an `uploading` row the next sync can reconcile against
+        # the remote, because the asset names it would use are the same ones.
         self.registry.upsert_file(
             file_id=file_id,
             rel_path=rel_path,
             size=size,
             mtime_ns=mtime_ns,
             source_sha256=source_sha256,
+            version_id=version_id,
             status=STATUS_UPLOADING,
             present=True,
             last_error=None,
@@ -567,6 +599,7 @@ class AppService:
                 mtime_ns,
                 source_sha256,
                 resume_version=resume_version,
+                version_id=version_id,
             )
         except NoAvailableAccountsError as exc:
             # A file with nowhere to go is one failed file, not a failed run:
@@ -961,187 +994,564 @@ class AppService:
         normalized["uploaded_bytes"] = int(normalized.get("uploaded_bytes", sum(int(copy.get("uploaded_bytes", 0)) for copy in copies)))
         return normalized
 
-    def _build_copy_manifest(
-        self,
-        *,
-        file_id: str,
-        rel_path: str,
-        version_id: str,
-        version_created_at: str,
-        encrypted: dict[str, Any],
-        size: int,
-        mtime_ns: int,
-        source_sha256: str,
-        target: UploadTarget,
-        chunk_items: list[tuple[int, bytes]],
-        copy_index: int,
-        copy_count: int,
-    ) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
-        client = self._client_for_account(target.account_id)
-        remote_prefix = f"{self.config.github_uploads_prefix}/{file_id}/{version_id}"
-        tree_entries: list[dict[str, Any]] = []
-        chunks_payload: list[dict[str, Any]] = []
-        uploaded_bytes = 0
+    # ── Releases backend ────────────────────────────────────────────────────
+    #
+    # One asset per part, at exactly one content-generating request per part,
+    # against five per file for the blob+commit path (chunk blob, manifest blob,
+    # tree, commit, ref). With a 500/hour secondary limit that path capped the
+    # service at ~100 files/hour no matter how fast the network was.
+    #
+    # The manifest is deliberately NOT per file: one manifest asset per release,
+    # rewritten at the end of a sync. A per-file manifest would double the cost
+    # back to 2 requests/file and cancel out half the gain.
 
-        for chunk_position, (chunk_index, chunk) in enumerate(chunk_items, start=1):
+    def _release_repository(self, state: dict[str, Any], account: GitHubAccountConfig) -> str:
+        """The repository that hosts an account's releases, resolved once.
+
+        Releases do not count against repository size, so there is no rollover
+        here and no per-file `list_managed_repositories` call — that used to run
+        once per file.
+        """
+        cached = self._release_repositories.get(account.account_id)
+        if cached:
+            return cached
+        stored = self.registry.get_meta(f"release_repo:{account.account_id}")
+        if stored:
+            self._release_repositories[account.account_id] = stored
+            return stored
+
+        if account.pinned_repository:
+            repo_name = account.pinned_repository
+        else:
+            repositories = self._refresh_managed_repositories(state, account)
+            repo_name = repositories[0].name if repositories else self._create_next_repository(state, account).name
+
+        self.registry.set_meta(f"release_repo:{account.account_id}", repo_name)
+        self._release_repositories[account.account_id] = repo_name
+        return repo_name
+
+    def _open_release(self, state: dict[str, Any], account: GitHubAccountConfig) -> ReleaseTarget:
+        row = self.registry.open_release_for_account(account.account_id)
+        if row is not None and row.release_id is not None and row.repo:
+            return ReleaseTarget(account.account_id, row.owner, row.repo, row.tag, int(row.release_id))
+        return self._create_next_release(state, account)
+
+    def _create_next_release(self, state: dict[str, Any], account: GitHubAccountConfig) -> ReleaseTarget:
+        owner = account.owner
+        repo = self._release_repository(state, account)
+        client = self._client_for_account(account.account_id)
+
+        for _ in range(64):
+            index = self.registry.next_release_index(account.account_id)
+            tag = f"{self.config.github_repository_prefix}-{index:04d}"
+            while self.registry.get_release(tag) is not None:
+                index += 1
+                tag = f"{self.config.github_repository_prefix}-{index:04d}"
+
+            try:
+                client.ensure_branch_initialized(owner, repo, self.config.github_branch)
+                release = client.get_or_create_release(owner, repo, tag)
+                assets = client.list_release_assets(owner, repo, int(release["id"]))
+            except GitHubError as exc:
+                if self._handle_account_access_error(state, account, exc):
+                    raise ServiceError(
+                        f"La cuenta {account.account_id} ha sido retirada del pool activo por permisos insuficientes."
+                    ) from exc
+                raise
+
+            # Reconcile against what is actually there: the tag may already hold
+            # assets from an interrupted run, and that listing is what makes
+            # resume idempotent.
+            self._remote_assets[tag] = {item["name"]: item for item in assets}
+            full = len(assets) >= RELEASE_ASSET_LIMIT - 1
+            self.registry.upsert_release(
+                tag=tag,
+                account_id=account.account_id,
+                owner=owner,
+                repo=repo,
+                release_id=int(release["id"]),
+                asset_count=len(assets),
+                sealed=full,
+            )
             LOGGER.info(
-                "sync subiendo chunk path=%s copia=%s/%s chunk=%s/%s size=%sB repo=%s",
-                rel_path,
-                copy_index,
-                copy_count,
-                chunk_position,
-                len(chunk_items),
-                len(chunk),
-                target.repository,
+                "sync release abierta cuenta=%s repo=%s/%s tag=%s assets=%s",
+                account.account_id, owner, repo, tag, len(assets),
             )
-            chunk_sha = client.create_blob(target.owner, target.repository, chunk)
-            chunk_path = f"{remote_prefix}/chunk_{chunk_index:04d}.bin"
-            tree_entries.append({"path": chunk_path, "mode": "100644", "type": "blob", "sha": chunk_sha})
-            chunks_payload.append(
-                {
-                    "index": chunk_index,
-                    "path": chunk_path,
-                    "raw_url": client.raw_url(target.owner, target.repository, target.branch, chunk_path),
-                    "sha256": sha256_bytes(chunk),
-                    "size": len(chunk),
-                    "repository": target.repository,
-                    "repository_owner": target.owner,
-                    "account_id": target.account_id,
-                    "network": "github",
-                }
-            )
-            uploaded_bytes += len(chunk)
+            if not full:
+                return ReleaseTarget(account.account_id, owner, repo, tag, int(release["id"]))
 
-        manifest_payload: dict[str, Any] = {
-            "version": 1,
-            "file_id": file_id,
-            "path": rel_path,
-            "version_id": version_id,
-            "created_at": version_created_at,
-            "plaintext_sha256": encrypted["plaintext_sha256"],
-            "ciphertext_sha256": encrypted["ciphertext_sha256"],
-            "size": size,
-            "mtime_ns": mtime_ns,
-            "source_sha256": source_sha256,
-            "repository_owner": target.owner,
-            "repository": target.repository,
-            "branch": target.branch,
-            "account_id": target.account_id,
-            "network": "github",
-            "copy_index": copy_index,
-            "copy_count_requested": copy_count,
-            "encryption": {
-                "algorithm": encrypted["algorithm"],
-                "nonce_b64": encrypted["nonce_b64"],
-                "key_id": "state-default",
-            },
-            "chunks": chunks_payload,
-        }
-        return manifest_payload, tree_entries, uploaded_bytes
+        raise ServiceError(f"No se pudo abrir una release con espacio para la cuenta {account.account_id}.")
 
-    def _upload_version_copy(
+    def _remote_asset(self, target: ReleaseTarget, release_tag: str, name: str) -> dict[str, Any] | None:
+        cached = self._remote_assets.get(release_tag)
+        if cached is None:
+            release = self.registry.get_release(release_tag)
+            if release is None or release.release_id is None:
+                return None
+            client = self._client_for_account(target.account_id)
+            try:
+                assets = client.list_release_assets(
+                    release.owner, release.repo, int(release.release_id)
+                )
+            except GitHubError as exc:
+                LOGGER.warning("sync no se pudo listar assets de %s: %s", release_tag, exc)
+                return None
+            cached = {item["name"]: item for item in assets}
+            self._remote_assets[release_tag] = cached
+        return cached.get(name)
+
+    def _upload_release_copy(
         self,
         state: dict[str, Any],
         *,
         file_id: str,
         rel_path: str,
+        file_path: Path,
         size: int,
         mtime_ns: int,
         source_sha256: str,
         version_id: str,
         version_created_at: str,
-        encrypted: dict[str, Any],
-        chunk_items: list[tuple[int, bytes]],
-        target: UploadTarget,
+        account: GitHubAccountConfig,
         copy_index: int,
         copy_count: int,
     ) -> dict[str, Any]:
-        client = self._client_for_account(target.account_id)
-        LOGGER.info(
-            "sync destino elegido path=%s copia=%s/%s cuenta=%s owner=%s repo=%s chunks=%s",
-            rel_path,
-            copy_index,
-            copy_count,
-            target.account_id,
-            target.owner,
-            target.repository,
-            len(chunk_items),
-        )
-        try:
-            client.ensure_branch_initialized(target.owner, target.repository, target.branch)
-            manifest_payload, tree_entries, uploaded_bytes = self._build_copy_manifest(
-                file_id=file_id,
-                rel_path=rel_path,
-                version_id=version_id,
-                version_created_at=version_created_at,
-                encrypted=encrypted,
-                size=size,
-                mtime_ns=mtime_ns,
-                source_sha256=source_sha256,
-                target=target,
-                chunk_items=chunk_items,
-                copy_index=copy_index,
-                copy_count=copy_count,
-            )
-            self._assert_target_capacity(state, target, uploaded_bytes + self._estimate_manifest_bytes(rel_path, len(chunk_items)))
-            manifest_bytes = json.dumps(manifest_payload, ensure_ascii=False, indent=2).encode("utf-8")
-            LOGGER.info(
-                "sync subiendo manifest path=%s copia=%s/%s size=%sB repo=%s",
-                rel_path,
-                copy_index,
-                copy_count,
-                len(manifest_bytes),
-                target.repository,
-            )
-            manifest_sha = client.create_blob(target.owner, target.repository, manifest_bytes)
-            remote_prefix = f"{self.config.github_uploads_prefix}/{file_id}/{version_id}"
-            manifest_path = f"{remote_prefix}/manifest.json"
-            tree_entries.append({"path": manifest_path, "mode": "100644", "type": "blob", "sha": manifest_sha})
-            uploaded_bytes += len(manifest_bytes)
-            commit_sha = client.commit_tree(
-                target.owner,
-                target.repository,
-                target.branch,
-                tree_entries,
-                f"spider-back sync {utc_now_iso()} ({rel_path})",
-            )
-            LOGGER.info(
-                "sync commit creado path=%s copia=%s/%s repo=%s commit=%s",
-                rel_path,
-                copy_index,
-                copy_count,
-                target.repository,
-                commit_sha,
-            )
-        except GitHubError as exc:
-            if self._handle_account_access_error(state, self.account_by_id[target.account_id], exc):
-                raise ServiceError(
-                    f"La cuenta {target.account_id} ha sido retirada del pool activo por permisos insuficientes."
-                ) from exc
-            raise
+        part_size = self.config.github_part_size_bytes
+        parts_total = max(1, math.ceil(size / part_size)) if size else 1
+        part_payloads: list[dict[str, Any]] = []
+        uploaded_bytes = 0
 
-        self._record_uploaded_bytes(state, target.account_id, uploaded_bytes)
-        self._bump_repository_size(state, target.account_id, target.repository, uploaded_bytes)
+        LOGGER.info(
+            "sync destino elegido path=%s copia=%s/%s cuenta=%s partes=%s",
+            rel_path, copy_index, copy_count, account.account_id, parts_total,
+        )
+
+        with file_path.open("rb") as source:
+            for part in range(parts_total):
+                target = self._open_release(state, account)
+                name = asset_name(file_id, version_id, part)
+
+                reused = self._reuse_existing_part(
+                    target, account, file_id, version_id, name, part, parts_total
+                )
+                if reused is not None:
+                    LOGGER.info(
+                        "sync parte ya presente path=%s parte=%s/%s asset=%s",
+                        rel_path, part + 1, parts_total, name,
+                    )
+                    part_payloads.append(reused)
+                    continue
+
+                source.seek(part * part_size)
+                length = min(part_size, size - part * part_size) if size else 0
+                with self._encrypted_part_file(
+                    file_id=file_id,
+                    version_id=version_id,
+                    part=part,
+                    parts=parts_total,
+                    source=source,
+                    length=length,
+                ) as (tmp_path, info):
+                    LOGGER.info(
+                        "sync subiendo parte path=%s parte=%s/%s size=%sB release=%s",
+                        rel_path, part + 1, parts_total, info.total_bytes, target.tag,
+                    )
+                    asset = self._upload_asset(state, account, target, name, tmp_path, info.total_bytes)
+
+                uploaded_bytes += info.total_bytes
+                asset_size = int(asset.get("size") or info.total_bytes)
+                self.registry.upsert_asset(
+                    name=name,
+                    file_id=file_id,
+                    version_id=version_id,
+                    part=part,
+                    parts=parts_total,
+                    release_tag=target.tag,
+                    github_asset_id=int(asset["id"]),
+                    size=asset_size,
+                    sha256=info.part_plaintext_sha256,
+                )
+                part_payloads.append(
+                    {
+                        "part": part,
+                        "parts": parts_total,
+                        "name": name,
+                        "asset_id": int(asset["id"]),
+                        "release_tag": target.tag,
+                        "size": asset_size,
+                        "plaintext_bytes": info.plaintext_bytes,
+                        "part_plaintext_sha256": info.part_plaintext_sha256,
+                        "nonce_b64": info.nonce_b64,
+                        "repository": target.repository,
+                        "repository_owner": target.owner,
+                        "account_id": account.account_id,
+                    }
+                )
+                self._releases_touched.add(target.tag)
+                count = self.registry.sync_release_asset_count(target.tag)
+                # Seal one short of the 1000-asset ceiling: the last slot is
+                # reserved for the release's consolidated manifest.
+                if count >= RELEASE_ASSET_LIMIT - 1:
+                    LOGGER.info("sync release %s llena (%s assets): sellada", target.tag, count)
+                    self.registry.seal_release(target.tag)
+
+        self._record_uploaded_bytes(state, account.account_id, uploaded_bytes)
+        primary_release = part_payloads[0]["release_tag"] if part_payloads else None
         return {
             "copy_index": copy_index,
             "network": "github",
+            "storage": STORAGE_RELEASE,
             "version_id": version_id,
-            "created_at": manifest_payload["created_at"],
-            "plaintext_sha256": encrypted["plaintext_sha256"],
-            "ciphertext_sha256": encrypted["ciphertext_sha256"],
+            "created_at": version_created_at,
+            "file_id": file_id,
+            "path": rel_path,
+            "plaintext_sha256": source_sha256,
+            "ciphertext_sha256": None,
             "size": size,
             "mtime_ns": mtime_ns,
             "source_sha256": source_sha256,
-            "manifest_path": manifest_path,
-            "manifest_raw_url": client.raw_url(target.owner, target.repository, target.branch, manifest_path),
-            "encryption": manifest_payload["encryption"],
-            "chunks": manifest_payload["chunks"],
-            "commit_sha": commit_sha,
-            "account_id": target.account_id,
-            "repository_owner": target.owner,
-            "repository": target.repository,
-            "branch": target.branch,
+            "account_id": account.account_id,
+            "repository_owner": account.owner,
+            "repository": self._release_repositories.get(account.account_id),
+            "branch": None,
+            "release_tag": primary_release,
+            "parts": part_payloads,
+            "chunks": [],
+            "encryption": {
+                "algorithm": "AES-256-GCM",
+                "key_id": "state-default",
+                # Each part carries its own nonce in its SPDR1 header, so a part
+                # is independently decryptable and verifiable.
+                "per_part_nonce": True,
+            },
+            "manifest_path": None,
+            "manifest_raw_url": None,
+            "commit_sha": None,
             "uploaded_bytes": uploaded_bytes,
+        }
+
+    def _reuse_existing_part(
+        self,
+        target: ReleaseTarget,
+        account: GitHubAccountConfig,
+        file_id: str,
+        version_id: str,
+        name: str,
+        part: int,
+        parts_total: int,
+    ) -> dict[str, Any] | None:
+        """Resume an interrupted upload by reconciling against the remote.
+
+        Deterministic asset names are what make this possible: we can ask
+        whether the part is already there instead of re-uploading it blindly.
+        Both the local row (which holds the part hash) and a non-empty remote
+        asset must be present — otherwise we cannot vouch for the content.
+
+        Scoped to this account: every copy of a version uses the same asset
+        name, so an unscoped lookup would let one copy adopt another's asset.
+        """
+        known = self.registry.find_account_asset(
+            file_id=file_id, version_id=version_id, part=part, account_id=account.account_id
+        )
+        if known is None or known.sha256 is None:
+            return None
+        remote = self._remote_asset(target, known.release_tag, name)
+        if remote is None or int(remote.get("size") or 0) <= 0:
+            return None
+        return {
+            "part": part,
+            "parts": parts_total,
+            "name": name,
+            "asset_id": int(remote["id"]),
+            "release_tag": known.release_tag,
+            "size": int(remote.get("size") or 0),
+            "plaintext_bytes": None,
+            "part_plaintext_sha256": known.sha256,
+            "nonce_b64": None,
+            "repository": target.repository,
+            "repository_owner": target.owner,
+            "account_id": target.account_id,
+        }
+
+    def _upload_asset(
+        self,
+        state: dict[str, Any],
+        account: GitHubAccountConfig,
+        target: ReleaseTarget,
+        name: str,
+        path: Path,
+        size: int,
+    ) -> dict[str, Any]:
+        client = self._client_for_account(account.account_id)
+        last_error = "desconocido"
+        for _ in range(3):
+            try:
+                with path.open("rb") as body:
+                    asset = client.upload_release_asset(
+                        target.owner, target.repository, target.release_id, name, body, size
+                    )
+            except GitHubError as exc:
+                if self._handle_account_access_error(state, account, exc):
+                    raise ServiceError(
+                        f"La cuenta {account.account_id} ha sido retirada del pool activo "
+                        "por permisos insuficientes."
+                    ) from exc
+                raise
+
+            if asset is None:
+                # Documented 422: the name is already taken. Deterministic names
+                # make this reachable on resume, so delete and re-upload.
+                last_error = "nombre duplicado (HTTP 422)"
+                self._delete_remote_asset(client, target, name)
+                continue
+
+            if int(asset.get("size") or 0) <= 0:
+                # A 502 can leave an empty asset behind; the returned size is
+                # the only way to notice.
+                last_error = "el asset quedo vacio tras la subida"
+                LOGGER.warning("sync asset vacio tras subir %s: se elimina y se reintenta", name)
+                try:
+                    client.delete_release_asset(target.owner, target.repository, int(asset["id"]))
+                except GitHubError:
+                    LOGGER.exception("sync no se pudo eliminar el asset vacio %s", name)
+                self._remote_assets.get(target.tag, {}).pop(name, None)
+                continue
+
+            self._remote_assets.setdefault(target.tag, {})[name] = asset
+            return asset
+
+        raise ServiceError(f"No se pudo subir el asset {name} a {target.tag}: {last_error}")
+
+    def _delete_remote_asset(self, client: GitHubClient, target: ReleaseTarget, name: str) -> None:
+        cached = self._remote_assets.setdefault(target.tag, {})
+        asset = cached.get(name)
+        if asset is None:
+            try:
+                for item in client.list_release_assets(target.owner, target.repository, target.release_id):
+                    cached[item["name"]] = item
+            except GitHubError:
+                LOGGER.exception("sync no se pudo listar assets de %s", target.tag)
+                return
+            asset = cached.get(name)
+        if asset is None:
+            return
+        try:
+            client.delete_release_asset(target.owner, target.repository, int(asset["id"]))
+        except GitHubError:
+            LOGGER.exception("sync no se pudo eliminar el asset duplicado %s", name)
+            return
+        cached.pop(name, None)
+        self.registry.delete_asset(target.tag, name)
+
+    @contextmanager
+    def _encrypted_part_file(
+        self,
+        *,
+        file_id: str,
+        version_id: str,
+        part: int,
+        parts: int,
+        source: Any = None,
+        length: int | None = None,
+        payload: bytes | None = None,
+    ):
+        """Encrypt one part to a temp file and hand back its path.
+
+        The file descriptor becomes the request body, so neither the plaintext
+        nor the ciphertext is ever fully in memory. Reading the whole file and
+        encrypting it in one shot peaked at ~2x the file size, which does not
+        work with ~1 GiB parts.
+        """
+        tmp_dir = self.config.app_state_dir / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        handle, tmp_name = tempfile.mkstemp(dir=tmp_dir, suffix=".spdr")
+        os.close(handle)
+        tmp_path = Path(tmp_name)
+        try:
+            info = write_part(
+                destination=tmp_path,
+                key=self.secrets.encryption_key_bytes(),
+                file_id=file_id,
+                version_id=version_id,
+                part=part,
+                parts=parts,
+                source=source,
+                length=length,
+                payload=payload,
+            )
+            yield tmp_path, info
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def _finalize_sync(self, state: dict[str, Any]) -> None:
+        for tag in sorted(self._releases_touched):
+            try:
+                self._write_release_manifest(state, tag)
+            except Exception:  # noqa: BLE001 - a manifest failure must not fail the sync
+                LOGGER.exception("sync no se pudo escribir el manifiesto de la release %s", tag)
+        self._releases_touched.clear()
+
+    def _write_release_manifest(self, state: dict[str, Any], tag: str) -> None:
+        """Rewrite a release's consolidated manifest: ~1 request per sync.
+
+        This is the only place the `file_id -> rel_path` mapping exists
+        remotely, which is what lets the data be reconstructed after a total
+        loss of local state. It is encrypted with the same key as the parts.
+        """
+        release = self.registry.get_release(tag)
+        if release is None or release.release_id is None:
+            return
+        account = self.account_by_id.get(release.account_id)
+        if account is None:
+            return
+
+        entries: dict[str, dict[str, Any]] = {}
+        for asset in self.registry.assets_for_release(tag):
+            entry = entries.setdefault(
+                asset.file_id,
+                {"version_id": asset.version_id, "parts": asset.parts, "assets": []},
+            )
+            entry["assets"].append(
+                {
+                    "name": asset.name,
+                    "part": asset.part,
+                    "size": asset.size,
+                    "part_plaintext_sha256": asset.sha256,
+                }
+            )
+        for file_id, entry in entries.items():
+            row = self.registry.get_file(file_id)
+            if row is not None:
+                entry["path"] = row.rel_path
+                entry["size"] = row.size
+                entry["source_sha256"] = row.source_sha256
+            entry["assets"].sort(key=lambda item: item["part"])
+
+        payload = json.dumps(
+            {
+                "version": 1,
+                "release_tag": tag,
+                "generated_at": utc_now_iso(),
+                "files": entries,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        target = ReleaseTarget(
+            account.account_id, release.owner, release.repo, tag, int(release.release_id)
+        )
+        client = self._client_for_account(account.account_id)
+        self._delete_remote_asset(client, target, MANIFEST_ASSET_NAME)
+        with self._encrypted_part_file(
+            file_id="manifest",
+            version_id=tag,
+            part=0,
+            parts=1,
+            payload=payload,
+        ) as (tmp_path, info):
+            self._upload_asset(state, account, target, MANIFEST_ASSET_NAME, tmp_path, info.total_bytes)
+        LOGGER.info("sync manifiesto consolidado escrito release=%s archivos=%s", tag, len(entries))
+
+    def _remote_asset_index(self) -> dict[str, dict[str, int]]:
+        """Presence and size of every remote asset, one listing per release.
+
+        Listings are reads: they do not touch the content-generating budget.
+        """
+        index: dict[str, dict[str, int]] = {}
+        for release in self.registry.list_releases():
+            if release.release_id is None or release.account_id not in self.github_clients:
+                continue
+            client = self._client_for_account(release.account_id)
+            try:
+                assets = client.list_release_assets(
+                    release.owner, release.repo, int(release.release_id)
+                )
+            except GitHubError as exc:
+                LOGGER.warning("verify no se pudieron listar los assets de %s: %s", release.tag, exc)
+                continue
+            index[release.tag] = {item["name"]: int(item.get("size") or 0) for item in assets}
+        return index
+
+    def _verify_release_copy(
+        self,
+        rel_path: str,
+        copy: dict[str, Any],
+        local_sha: str | None,
+        *,
+        deep: bool,
+        remote_assets: dict[str, dict[str, int]],
+    ) -> dict[str, Any]:
+        copy_index = copy.get("copy_index")
+        account_id = copy.get("account_id")
+        parts = sorted(copy.get("parts", []), key=lambda item: item["part"])
+        if not parts:
+            raise ServiceError(f"La copia {copy_index} de {rel_path} no declara ninguna parte.")
+
+        # Metadata tier: presence and size of every part. Catches assets that
+        # are missing outright and assets that were truncated.
+        problems: list[str] = []
+        for part in parts:
+            remote_size = (remote_assets.get(part["release_tag"]) or {}).get(part["name"])
+            if remote_size is None:
+                problems.append(f"{part['name']} ausente")
+            elif int(remote_size) != int(part.get("size") or 0):
+                problems.append(f"{part['name']} mide {remote_size}B y deberia medir {part.get('size')}B")
+        if problems:
+            raise ServiceError(
+                f"Assets inconsistentes para {rel_path} (copia {copy_index}): {'; '.join(problems)}"
+            )
+
+        if not deep or local_sha is None:
+            return {
+                "ok": True,
+                "copy_index": copy_index,
+                "network": "github",
+                "storage": STORAGE_RELEASE,
+                "depth": "metadata",
+                "account_id": account_id,
+                "repository": copy.get("repository"),
+                "parts_checked": len(parts),
+            }
+
+        client = self._client_for_account(account_id)
+        whole_hasher = hashlib.sha256()
+        for part in parts:
+            release = self.registry.get_release(part["release_tag"])
+            owner = release.owner if release else copy.get("repository_owner")
+            repo = release.repo if release else copy.get("repository")
+            header, blocks, digest = iter_decrypted_part(
+                client.stream_release_asset(owner, repo, int(part["asset_id"])),
+                self.secrets.encryption_key_bytes(),
+            )
+            if int(header.get("part", -1)) != int(part["part"]):
+                raise ServiceError(
+                    f"Parte descolocada en {rel_path}: la cabecera dice {header.get('part')} "
+                    f"y se esperaba {part['part']}"
+                )
+            for block in blocks:
+                whole_hasher.update(block)
+            expected = part.get("part_plaintext_sha256")
+            if expected and digest.digest != expected:
+                raise ServiceError(
+                    f"Parte corrupta: {rel_path}#{part['part']} (copia {copy_index})"
+                )
+
+        remote_sha = whole_hasher.hexdigest()
+        if remote_sha != local_sha:
+            raise ServiceError(
+                f"Hash distinto para {rel_path} (copia {copy_index}): local={local_sha} remoto={remote_sha}"
+            )
+        return {
+            "ok": True,
+            "copy_index": copy_index,
+            "network": "github",
+            "storage": STORAGE_RELEASE,
+            "depth": "deep",
+            "account_id": account_id,
+            "repository": copy.get("repository"),
+            "remote_sha256": remote_sha,
+            "chunks_checked": len(parts),
+            "parts_checked": len(parts),
         }
 
     def _upload_telegram_version_copy(
@@ -1227,127 +1637,117 @@ class AppService:
         mtime_ns: int,
         source_sha256: str,
         resume_version: dict[str, Any] | None = None,
+        version_id: str | None = None,
     ) -> dict[str, Any]:
-        plaintext = file_path.read_bytes()
         base_version = self._normalize_version(resume_version) if resume_version else None
         if base_version:
-            nonce_b64 = base_version["encryption"]["nonce_b64"]
-            nonce_padding = "=" * (-len(nonce_b64) % 4)
-            nonce = base64.urlsafe_b64decode(nonce_b64 + nonce_padding)
-            encrypted = encrypt_bytes_with_nonce(plaintext, self.secrets.encryption_key_bytes(), nonce)
             version_id = base_version["version_id"]
             version_created_at = base_version.get("created_at", utc_now_iso())
             copy_count = int(base_version.get("copy_count_requested", self.config.copy_count))
-            used_account_ids = {copy.get("account_id") for copy in base_version.get("copies", []) if copy.get("account_id")}
+            used_account_ids = {
+                copy.get("account_id") for copy in base_version.get("copies", []) if copy.get("account_id")
+            }
             copies: list[dict[str, Any]] = [deepcopy(copy) for copy in base_version.get("copies", [])]
-            copy_errors = list(base_version.get("copy_errors", []))
+            copy_errors: list[dict[str, Any]] = list(base_version.get("copy_errors", []))
         else:
-            encrypted = encrypt_bytes(plaintext, self.secrets.encryption_key_bytes())
-            version_id = utc_now_compact()
+            version_id = version_id or utc_now_compact()
             version_created_at = utc_now_iso()
             copy_count = self.config.copy_count
             used_account_ids = set()
             copies = []
             copy_errors = []
 
-        chunk_items = list(chunk_bytes(encrypted["ciphertext"], self.config.github_chunk_size_bytes))
-        estimated_upload_bytes = len(encrypted["ciphertext"]) + self._estimate_manifest_bytes(rel_path, len(chunk_items))
-        remaining_accounts = list(account for account in self.config.github_accounts if account.account_id not in used_account_ids)
+        estimated_upload_bytes = self._estimate_encrypted_size(size)
 
-        while len(copies) < copy_count and remaining_accounts:
+        # Phase 1: GitHub copies, streamed straight into release assets.
+        while len(copies) < copy_count:
             try:
-                target = self._allocate_upload_target(state, estimated_upload_bytes, excluded_account_ids=used_account_ids)
+                account = self._allocate_release_account(
+                    state, estimated_upload_bytes, excluded_account_ids=used_account_ids
+                )
             except NoAvailableAccountsError:
                 break
-            if target.account_id in used_account_ids:
-                remaining_accounts = [account for account in remaining_accounts if account.account_id != target.account_id]
-                continue
             try:
-                copy = self._upload_version_copy(
+                copy = self._upload_release_copy(
                     state,
                     file_id=file_id,
                     rel_path=rel_path,
+                    file_path=file_path,
                     size=size,
                     mtime_ns=mtime_ns,
                     source_sha256=source_sha256,
                     version_id=version_id,
                     version_created_at=version_created_at,
-                    encrypted=encrypted,
-                    chunk_items=chunk_items,
-                    target=target,
+                    account=account,
                     copy_index=len(copies) + 1,
                     copy_count=copy_count,
                 )
                 copies.append(copy)
-                used_account_ids.add(target.account_id)
-                remaining_accounts = [account for account in remaining_accounts if account.account_id != target.account_id]
             except NoAvailableAccountsError:
                 break
-            except ServiceError as exc:
+            except (ServiceError, GitHubError) as exc:
                 LOGGER.warning(
-                    "sync copia GitHub fallida path=%s cuenta=%s: %s",
-                    rel_path, target.account_id, exc,
+                    "sync copia GitHub fallida path=%s cuenta=%s: %s", rel_path, account.account_id, exc
                 )
                 copy_errors.append(
                     {
                         "copy_index": len(copies) + 1,
-                        "account_id": target.account_id,
+                        "account_id": account.account_id,
                         "network": "github",
                         "error": str(exc),
                     }
                 )
-                used_account_ids.add(target.account_id)
-                remaining_accounts = [account for account in remaining_accounts if account.account_id != target.account_id]
-                continue
+            used_account_ids.add(account.account_id)
 
-        # Fase 2: colocar copias restantes en cuentas Telegram
+        # Phase 2: Telegram copies. Out of scope for the Releases work, so this
+        # path is unchanged — including the fact that it materialises the file
+        # in memory under a single nonce.
         remaining_telegram_accounts = [
-            acc for acc in self.config.telegram_accounts
-            if acc.account_id not in used_account_ids
+            acc for acc in self.config.telegram_accounts if acc.account_id not in used_account_ids
         ]
-        for tg_account in remaining_telegram_accounts:
-            if len(copies) >= copy_count:
-                break
-            try:
-                copy = self._upload_telegram_version_copy(
-                    state,
-                    file_id=file_id,
-                    rel_path=rel_path,
-                    size=size,
-                    mtime_ns=mtime_ns,
-                    source_sha256=source_sha256,
-                    version_id=version_id,
-                    version_created_at=version_created_at,
-                    encrypted=encrypted,
-                    chunk_items=chunk_items,
-                    account=tg_account,
-                    copy_index=len(copies) + 1,
-                    copy_count=copy_count,
-                )
-                copies.append(copy)
-                used_account_ids.add(tg_account.account_id)
-            except (TelegramError, ServiceError) as exc:
-                LOGGER.warning(
-                    "sync copia Telegram fallida path=%s cuenta=%s: %s",
-                    rel_path, tg_account.account_id, exc,
-                )
-                copy_errors.append(
-                    {
-                        "copy_index": len(copies) + 1,
-                        "account_id": tg_account.account_id,
-                        "network": "telegram",
-                        "error": str(exc),
-                    }
-                )
+        if remaining_telegram_accounts and len(copies) < copy_count:
+            encrypted = encrypt_bytes(file_path.read_bytes(), self.secrets.encryption_key_bytes())
+            chunk_items = list(chunk_bytes(encrypted["ciphertext"], self.config.github_chunk_size_bytes))
+            for tg_account in remaining_telegram_accounts:
+                if len(copies) >= copy_count:
+                    break
+                try:
+                    copy = self._upload_telegram_version_copy(
+                        state,
+                        file_id=file_id,
+                        rel_path=rel_path,
+                        size=size,
+                        mtime_ns=mtime_ns,
+                        source_sha256=source_sha256,
+                        version_id=version_id,
+                        version_created_at=version_created_at,
+                        encrypted=encrypted,
+                        chunk_items=chunk_items,
+                        account=tg_account,
+                        copy_index=len(copies) + 1,
+                        copy_count=copy_count,
+                    )
+                    copies.append(copy)
+                except (TelegramError, ServiceError) as exc:
+                    LOGGER.warning(
+                        "sync copia Telegram fallida path=%s cuenta=%s: %s",
+                        rel_path, tg_account.account_id, exc,
+                    )
+                    copy_errors.append(
+                        {
+                            "copy_index": len(copies) + 1,
+                            "account_id": tg_account.account_id,
+                            "network": "telegram",
+                            "error": str(exc),
+                        }
+                    )
                 used_account_ids.add(tg_account.account_id)
 
         if not copies:
-            # Mensaje honesto: antes siempre se culpaba al cupo de GitHub, aun
-            # cuando el verdadero motivo era un fallo en la copia de Telegram.
-            # Incluimos los errores reales por cuenta para poder diagnosticar.
+            # Report the real reason: this used to always blame the GitHub quota
+            # even when the actual failure was a Telegram copy.
             error_details = "; ".join(
-                f"{err.get('network')}/{err.get('account_id')}: {err.get('error')}"
-                for err in copy_errors
+                f"{err.get('network')}/{err.get('account_id')}: {err.get('error')}" for err in copy_errors
             )
             if error_details:
                 message = f"No se pudo subir ninguna copia. Errores por cuenta: {error_details}"
@@ -1365,13 +1765,14 @@ class AppService:
 
         primary_copy = copies[0]
         version: dict[str, Any] = {
-            "version": 2,
+            "version": 3,
             "file_id": file_id,
             "path": rel_path,
             "version_id": version_id,
             "created_at": version_created_at,
-            "plaintext_sha256": encrypted["plaintext_sha256"],
-            "ciphertext_sha256": encrypted["ciphertext_sha256"],
+            "storage": primary_copy.get("storage", STORAGE_RELEASE),
+            "plaintext_sha256": primary_copy.get("plaintext_sha256", source_sha256),
+            "ciphertext_sha256": primary_copy.get("ciphertext_sha256"),
             "size": size,
             "mtime_ns": mtime_ns,
             "source_sha256": source_sha256,
@@ -1382,106 +1783,54 @@ class AppService:
             "copy_errors": copy_errors if len(copies) < copy_count else [],
             "copies": copies,
             "account_id": primary_copy["account_id"],
-            "repository_owner": primary_copy["repository_owner"],
-            "repository": primary_copy["repository"],
-            "branch": primary_copy["branch"],
-            "manifest_path": primary_copy["manifest_path"],
-            "manifest_raw_url": primary_copy["manifest_raw_url"],
-            "commit_sha": primary_copy["commit_sha"],
-            "encryption": primary_copy["encryption"],
-            "chunks": primary_copy["chunks"],
+            "repository_owner": primary_copy.get("repository_owner"),
+            "repository": primary_copy.get("repository"),
+            "branch": primary_copy.get("branch"),
+            "manifest_path": primary_copy.get("manifest_path"),
+            "manifest_raw_url": primary_copy.get("manifest_raw_url"),
+            "commit_sha": primary_copy.get("commit_sha"),
+            "encryption": primary_copy.get("encryption", {}),
+            "chunks": primary_copy.get("chunks", []),
             "uploaded_bytes": sum(int(copy.get("uploaded_bytes", 0)) for copy in copies),
         }
-        version = self._normalize_version(version)
-        return version
+        return self._normalize_version(version)
 
-    def _allocate_upload_target(self, state: dict[str, Any], estimated_upload_bytes: int, excluded_account_ids: set[str] | None = None) -> UploadTarget:
-        eligible_accounts: list[GitHubAccountConfig] = []
-        today = self._today_bucket()
-        estimated_upload_kb = math.ceil(estimated_upload_bytes / 1024)
+    def _estimate_encrypted_size(self, size: int) -> int:
+        parts = max(1, math.ceil(size / self.config.github_part_size_bytes)) if size else 1
+        return size + parts * (PREFIX_SIZE + HEADER_RESERVED + GCM_TAG_BYTES)
+
+    def _allocate_release_account(
+        self,
+        state: dict[str, Any],
+        estimated_upload_bytes: int,
+        excluded_account_ids: set[str] | None = None,
+    ) -> GitHubAccountConfig:
+        """Pick an account with daily quota left.
+
+        Repository size is no longer part of this decision: releases do not
+        count against it, which is what removes GITHUB_REPOSITORY_MAX_SIZE_KB
+        and the per-file repository rollover from the write path.
+        """
         excluded_account_ids = excluded_account_ids or set()
+        today = self._today_bucket()
+        eligible: list[GitHubAccountConfig] = []
 
         for account in self.config.github_accounts:
             if account.account_id in excluded_account_ids:
                 continue
-            account_state = self._account_state(state, account.account_id, owner=account.owner)
             if account.account_id in self._runtime_unavailable_accounts:
                 continue
+            account_state = self._account_state(state, account.account_id, owner=account.owner)
             used_today = int(account_state["daily_uploads"].get(today, 0))
             if used_today + estimated_upload_bytes > self.config.github_account_daily_upload_limit_bytes:
                 continue
-            eligible_accounts.append(account)
+            eligible.append(account)
 
-        if not eligible_accounts:
-            raise NoAvailableAccountsError("Ninguna cuenta GitHub tiene cuota diaria disponible para esta subida.")
-
-        remaining_accounts = list(eligible_accounts)
-        last_error: ServiceError | None = None
-        while remaining_accounts:
-            account = self._choose(remaining_accounts)
-            remaining_accounts.remove(account)
-            try:
-                return self._allocate_upload_target_for_account(state, account, estimated_upload_kb)
-            except ServiceError as exc:
-                last_error = exc
-                if account.account_id in self._runtime_unavailable_accounts:
-                    LOGGER.warning(
-                        "sync cuenta no disponible, probando otra cuenta cuenta=%s owner=%s motivo=%s",
-                        account.account_id,
-                        account.owner,
-                        exc,
-                    )
-                    continue
-                raise
-
-        if last_error:
-            raise last_error
-        raise ServiceError("No se pudo seleccionar una cuenta GitHub para esta subida.")
-
-    def _allocate_upload_target_for_account(
-        self,
-        state: dict[str, Any],
-        account: GitHubAccountConfig,
-        estimated_upload_kb: int,
-    ) -> UploadTarget:
-        account_state = self._account_state(state, account.account_id, owner=account.owner)
-
-        if account.pinned_repository:
-            repo_info = self._refresh_repository_info(state, account, account.pinned_repository)
-            if repo_info.size_kb + estimated_upload_kb > self.config.github_repository_max_size_kb:
-                raise ServiceError(f"El repositorio legado {account.owner}/{account.pinned_repository} excede el limite.")
-            return UploadTarget(account.account_id, account.owner, account.pinned_repository, self.config.github_branch, True)
-
-        repositories = self._refresh_managed_repositories(state, account)
-        eligible_repositories = [
-            repo
-            for repo in repositories
-            if repo.size_kb + estimated_upload_kb <= self.config.github_repository_max_size_kb
-        ]
-        if eligible_repositories:
-            repo = self._choose(eligible_repositories)
-            return UploadTarget(account.account_id, account.owner, repo.name, self.config.github_branch, repo.private)
-
-        repo = self._create_next_repository(state, account)
-        return UploadTarget(account.account_id, account.owner, repo.name, self.config.github_branch, repo.private)
-
-    def _assert_target_capacity(self, state: dict[str, Any], target: UploadTarget, upload_bytes: int) -> None:
-        account_state = self._account_state(state, target.account_id, owner=target.owner)
-        today = self._today_bucket()
-        used_today = int(account_state["daily_uploads"].get(today, 0))
-        if used_today + upload_bytes > self.config.github_account_daily_upload_limit_bytes:
-            raise ServiceError(f"La cuenta {target.account_id} ha superado su cuota diaria.")
-
-        repo_state = account_state["repositories"].get(target.repository)
-        current_size_kb = int(repo_state.get("last_known_size_kb", 0)) if repo_state else 0
-        # A fresh/empty repository must always accept at least one upload: a
-        # single version's manifest + chunks cannot be split across repos, so
-        # rejecting it here would make the data unstorable (and breaks repo
-        # rollover when a small per-repo cap is smaller than the upload). Only
-        # enforce the cap once the repo already holds data — that is what drives
-        # allocation to roll over to (or create) the next repo.
-        if current_size_kb > 0 and current_size_kb + math.ceil(upload_bytes / 1024) > self.config.github_repository_max_size_kb:
-            raise ServiceError(f"El repositorio {target.owner}/{target.repository} supera el limite configurado.")
+        if not eligible:
+            raise NoAvailableAccountsError(
+                "Ninguna cuenta GitHub tiene cupo diario disponible para esta subida."
+            )
+        return self._choose(eligible)
 
     def _refresh_managed_repositories(self, state: dict[str, Any], account: GitHubAccountConfig) -> list[RepositoryInfo]:
         client = self._client_for_account(account.account_id)
@@ -1510,25 +1859,6 @@ class AppService:
                 known[repo_name].setdefault("name", repo_name)
         account_state["last_metadata_refresh_at"] = utc_now_iso()
         return repositories
-
-    def _refresh_repository_info(self, state: dict[str, Any], account: GitHubAccountConfig, repository: str) -> RepositoryInfo:
-        client = self._client_for_account(account.account_id)
-        try:
-            info = client.get_repository(account.owner, repository)
-        except GitHubError as exc:
-            if self._handle_account_access_error(state, account, exc):
-                raise ServiceError(
-                    f"La cuenta {account.account_id} ha sido retirada del pool activo por permisos insuficientes."
-                ) from exc
-            raise
-        repo_state = self._account_state(state, account.account_id, owner=account.owner)["repositories"].setdefault(repository, {})
-        repo_state["name"] = repository
-        repo_state["owner"] = account.owner
-        repo_state["network"] = "github"
-        repo_state["last_known_size_kb"] = info.size_kb
-        repo_state["private"] = info.private
-        repo_state["last_refreshed_at"] = utc_now_iso()
-        return info
 
     def _create_next_repository(self, state: dict[str, Any], account: GitHubAccountConfig) -> RepositoryInfo:
         account_state = self._account_state(state, account.account_id, owner=account.owner)
@@ -1610,15 +1940,6 @@ class AppService:
         today = self._today_bucket()
         account_state["daily_uploads"][today] = int(account_state["daily_uploads"].get(today, 0)) + uploaded_bytes
         account_state["last_upload_at"] = utc_now_iso()
-
-    def _bump_repository_size(self, state: dict[str, Any], account_id: str, repository: str, uploaded_bytes: int) -> None:
-        account_state = self._account_state(state, account_id)
-        repo_state = account_state["repositories"].setdefault(repository, {})
-        repo_state["last_known_size_kb"] = int(repo_state.get("last_known_size_kb", 0)) + math.ceil(uploaded_bytes / 1024)
-        repo_state["last_refreshed_at"] = utc_now_iso()
-
-    def _estimate_manifest_bytes(self, rel_path: str, chunk_count: int) -> int:
-        return 2048 + len(rel_path.encode("utf-8")) + chunk_count * 512
 
     def _sleep_after_upload(self) -> None:
         """Artificial throttle, kept only for the Telegram path.

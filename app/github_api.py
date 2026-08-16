@@ -21,6 +21,9 @@ from .rate_limit import (
 LOGGER = logging.getLogger("spider-back")
 
 API_BASE_URL = "https://api.github.com"
+# Asset bodies go to a different host, and as raw binary rather than base64:
+# 2 GiB per asset against the Blob API's 100 MB (+33% for base64).
+UPLOADS_BASE_URL = "https://uploads.github.com"
 
 # Only transient failures belong here. 401 (bad credentials) and 422
 # (unprocessable) are permanent: retrying them with a 2s->4s backoff just burns
@@ -103,6 +106,10 @@ class GitHubClient:
         while attempt < self.settings.max_retry:
             self.rate_limiter.before_request(content_generating=content_generating)
             request_kwargs = dict(kwargs)
+            # A retried upload must resend from the start of the body.
+            body = request_kwargs.get("data")
+            if hasattr(body, "seek"):
+                body.seek(0)
             try:
                 with self.rate_limiter.slot():
                     response = self._session.request(
@@ -287,6 +294,107 @@ class GitHubClient:
         commit_sha = self.create_commit(owner, repo, tree_sha, head_commit_sha, message)
         self.update_ref(owner, repo, branch, commit_sha)
         return commit_sha
+
+    # ── releases ────────────────────────────────────────────────────────────
+    #
+    # One asset per part costs exactly one content-generating request, against
+    # five per file for the blob+commit path (blob, manifest blob, tree, commit,
+    # ref). A release amortises its own creation across up to 1000 assets, and
+    # an asset is reachable the moment the API returns 201 — unlike a blob,
+    # which is collectable garbage until a commit references it.
+
+    def get_release_by_tag(self, owner: str, repo: str, tag: str) -> dict[str, Any] | None:
+        response = self._request(
+            "GET",
+            self._repo_url(owner, repo, f"releases/tags/{tag}"),
+            expected_status=(200, 404),
+        )
+        return response.json() if response.status_code == 200 else None
+
+    def create_release(self, owner: str, repo: str, tag: str, name: str | None = None) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            self._repo_url(owner, repo, "releases"),
+            json={
+                "tag_name": tag,
+                "name": name or tag,
+                "draft": False,
+                "prerelease": False,
+            },
+        )
+        return response.json()
+
+    def get_or_create_release(self, owner: str, repo: str, tag: str) -> dict[str, Any]:
+        existing = self.get_release_by_tag(owner, repo, tag)
+        if existing is not None:
+            return existing
+        return self.create_release(owner, repo, tag)
+
+    def list_release_assets(self, owner: str, repo: str, release_id: int) -> list[dict[str, Any]]:
+        assets: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            response = self._request(
+                "GET",
+                self._repo_url(owner, repo, f"releases/{release_id}/assets"),
+                params={"per_page": 100, "page": page},
+            )
+            items = response.json()
+            assets.extend(items)
+            if len(items) < 100:
+                break
+            page += 1
+        return assets
+
+    def upload_release_asset(
+        self,
+        owner: str,
+        repo: str,
+        release_id: int,
+        name: str,
+        body: Any,
+        size: int,
+    ) -> dict[str, Any] | None:
+        """Upload one asset. Returns ``None`` when the name is already taken.
+
+        A duplicate name is a documented 422; the caller deletes the existing
+        asset and retries rather than treating it as a hard failure.
+        """
+        response = self._request(
+            "POST",
+            f"{UPLOADS_BASE_URL}/repos/{owner}/{repo}/releases/{release_id}/assets",
+            params={"name": name},
+            data=body,
+            headers={
+                **self.headers,
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(size),
+            },
+            expected_status=(201, 422),
+            content_generating=True,
+        )
+        if response.status_code == 422:
+            return None
+        return response.json()
+
+    def delete_release_asset(self, owner: str, repo: str, asset_id: int) -> None:
+        self._request(
+            "DELETE",
+            self._repo_url(owner, repo, f"releases/assets/{asset_id}"),
+            expected_status=(204, 404),
+        )
+
+    def stream_release_asset(
+        self, owner: str, repo: str, asset_id: int, chunk_size: int = 4 * 1024 * 1024
+    ):
+        """Download an asset without holding it in memory."""
+        response = self._request(
+            "GET",
+            self._repo_url(owner, repo, f"releases/assets/{asset_id}"),
+            headers={**self.headers, "Accept": "application/octet-stream"},
+            stream=True,
+        )
+        return response.iter_content(chunk_size=chunk_size)
 
     @staticmethod
     def raw_url(owner: str, repo: str, branch: str, path: str) -> str:

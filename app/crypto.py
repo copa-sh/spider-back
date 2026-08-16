@@ -35,6 +35,48 @@ def decrypt_bytes(ciphertext: bytes, key: bytes, nonce_b64: str) -> bytes:
     return aesgcm.decrypt(nonce, ciphertext, None)
 
 
+class StreamingAESGCMEncryptor:
+    """Encrypt without holding the plaintext in memory.
+
+    Symmetric to :class:`StreamingAESGCMDecryptor`: the 16-byte GCM tag is
+    appended to the ciphertext, so what ``update()`` plus ``finalize()`` emit
+    feeds straight back into the decryptor.
+
+    Reading a whole file into RAM and encrypting it in one shot peaked at ~2x
+    the file size, which is not viable with ~1 GiB parts. Each part gets its own
+    random nonce, so it is independently decryptable and verifiable; a nonce is
+    never reused under the same key.
+    """
+
+    def __init__(self, key: bytes, nonce: bytes | None = None):
+        self._nonce = nonce or secrets.token_bytes(12)
+        self._encryptor = Cipher(algorithms.AES(key), modes.GCM(self._nonce)).encryptor()
+        self._plaintext_hasher = hashlib.sha256()
+        self._finished = False
+
+    @property
+    def nonce(self) -> bytes:
+        return self._nonce
+
+    @property
+    def nonce_b64(self) -> str:
+        return base64.urlsafe_b64encode(self._nonce).decode().rstrip("=")
+
+    def update(self, data: bytes) -> bytes:
+        if self._finished:
+            raise ValueError("El cifrador ya se ha cerrado.")
+        self._plaintext_hasher.update(data)
+        return self._encryptor.update(data)
+
+    def finalize(self) -> tuple[bytes, str]:
+        """Return the ciphertext tail plus the GCM tag, and the plaintext hash."""
+        if self._finished:
+            raise ValueError("El cifrador ya se ha cerrado.")
+        tail = self._encryptor.finalize()
+        self._finished = True
+        return tail + self._encryptor.tag, self._plaintext_hasher.hexdigest()
+
+
 class StreamingAESGCMDecryptor:
     def __init__(self, key: bytes, nonce_b64: str):
         padding = "=" * (-len(nonce_b64) % 4)
