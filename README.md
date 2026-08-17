@@ -8,6 +8,7 @@ Funciona como una segunda capa de cifrado y fragmentación sobre el contenido de
 
 - **Backends soportados**: GitHub (múltiples cuentas/repos) y Telegram (múltiples canales privados) — simultáneamente si se desea.
 - Cifrado doble: `gocryptfs` (opcional) + AES-256-GCM propio, con un nonce por parte.
+- Recorrido repartido por todo el árbol: una copia interrumpida deja un poco de todo.
 - En GitHub, los datos se guardan como **assets de release**: 1 petición por parte, partes de ~1 GiB.
 - **Dos operaciones**: `sync` (solo lo nuevo o modificado) y `verify` (sin escrituras).
 - Arranque proporcional al número de cambios, no al volumen total.
@@ -20,7 +21,8 @@ Funciona como una segunda capa de cifrado y fragmentación sobre el contenido de
 
 ## Cómo funciona
 
-1. Recorre `/datos` (solo lectura) en orden determinista y en streaming.
+1. Recorre `/datos` (solo lectura) en un orden determinista que reparte el
+   escaneo por todo el árbol (ver `SYNC_ORDER`).
 2. Para cada ruta hace una consulta indexada al registro local. Si `size` y `mtime_ns`
    coinciden y la fila está `complete`, **se salta sin hashear y sin abrir el archivo**.
 3. Si cambiaron, calcula el hash. Si el hash coincide con el registrado, solo actualiza
@@ -321,6 +323,31 @@ header = {nonce_b64, file_id, version_id, part, parts, part_plaintext_sha256}
   (`{GITHUB_REPOSITORY_PREFIX}-{NNNN}`). Esto sustituye a la rotación de repositorios y a
   `GITHUB_REPOSITORY_MAX_SIZE_KB` para los datos nuevos.
 
+### Orden de recorrido (`SYNC_ORDER`)
+
+Importa para la durabilidad, no solo para el rendimiento: la primera sincronización
+de un corpus grande dura horas, y lo que quede copiado si se interrumpe depende del
+orden en que se recorra.
+
+- **`spread` (por defecto)**: ordena por `stable_file_id`, es decir por un hash de la
+  ruta relativa. El reparto es uniforme sobre todo el árbol, así que una copia a
+  medias deja **un poco de todo** en lugar de una sola región. En un `/datos`
+  organizado por fechas, el orden alfabético es cronológico: una copia parcial en
+  ese orden serían solo los años más antiguos, que es justo lo que hay que evitar.
+- **`path`**: orden de directorio. Recorre en streaming (no guarda nada más que las
+  entradas del directorio actual) y tiene la mejor localidad de disco, pero
+  concentra la cobertura parcial en una zona del árbol.
+
+Los dos son **deterministas**: el mismo orden en cada ejecución. La implementación
+anterior barajaba con `random.shuffle`, lo que daba el reparto pero hacía que una
+sincronización interrumpida no fuese reproducible y obligaba a materializar el árbol
+entero. `spread` conserva el reparto y añade la estabilidad; sigue necesitando la
+lista de rutas en memoria (unos pocos MB para 100k archivos), y `path` es la salida
+para árboles muy grandes donde eso importe.
+
+El orden de recorrido no afecta a la reanudación: una fila ya `complete` se salta por
+`(size, mtime_ns)` da igual cuándo se visite.
+
 ### Las dos operaciones
 
 **`sync`** — solo lo nuevo o modificado. No existe ya un modo «completo»: la sync ligera
@@ -456,6 +483,7 @@ Sesiones MTProto:
 | --- | --- | --- | --- |
 | `COPY_COUNT` | No | `1` | Número de copias de cada versión. Cada copia se coloca entera en una cuenta distinta (de cualquier red: GitHub, Telegram, etc.). |
 | `VERIFY_DEEP_EVERY_N` | No | `1` | La verificación profunda cubre 1 archivo de cada N por ejecución, rotando. `N=1` lo comprueba todo cada vez. |
+| `SYNC_ORDER` | No | `spread` | Orden de recorrido de `APP_DATA_DIR`: `spread` (por hash de la ruta, reparte la cobertura por todo el árbol) o `path` (orden de directorio, streaming puro). |
 
 Notas de compatibilidad:
 

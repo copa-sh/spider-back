@@ -120,6 +120,7 @@ class AppService:
             "sync_interval_seconds": config.app_sync_interval_seconds,
             "verify_interval_seconds": config.app_verify_interval_seconds,
             "chunk_size_mb": config.github_chunk_size_mb,
+            "sync_order": config.sync_order,
             "upload_sleep_min_seconds": config.github_upload_sleep_min_seconds,
             "upload_sleep_max_seconds": config.github_upload_sleep_max_seconds,
         }
@@ -359,7 +360,10 @@ class AppService:
 
         self._ensure_github_accounts_state(state)
         run = self.registry.next_counter("sync_run")
-        LOGGER.info("sync escaneando directorio=%s run=%s", self.config.app_data_dir, run)
+        LOGGER.info(
+            "sync escaneando directorio=%s run=%s orden=%s",
+            self.config.app_data_dir, run, self.config.sync_order,
+        )
 
         counters = {
             "scanned": 0,
@@ -372,7 +376,7 @@ class AppService:
         }
         last_log_at = time.monotonic()
 
-        for file_path in iter_files(self.config.app_data_dir):
+        for file_path in iter_files(self.config.app_data_dir, order=self.config.sync_order):
             rel_path = rel_path_str(self.config.app_data_dir, file_path)
             file_id = stable_file_id(rel_path)
             try:

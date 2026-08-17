@@ -1418,3 +1418,38 @@ def test_files_listing_is_paginated(tmp_path):
     second = client.get("/files?per_page=2&page=2")
     assert b"archivo2.txt" in second.data
     assert b"archivo0.txt" not in second.data
+
+
+def test_sync_walks_in_the_configured_order(tmp_path):
+    """An interrupted first sync must leave a bit of everything backed up, so
+    the walk order is part of the durability story, not just an internal detail."""
+    service, data_dir, _ = make_service(tmp_path)
+    years = ["2019", "2020", "2021", "2022"]
+    for year in years:
+        (data_dir / year).mkdir()
+        for index in range(8):
+            (data_dir / year / f"foto{index}.jpg").write_text(f"{year}-{index}", encoding="utf-8")
+
+    uploaded_order: list[str] = []
+    original = service._upload_release_copy
+
+    def record(*args, **kwargs):
+        uploaded_order.append(kwargs["rel_path"])
+        return original(*args, **kwargs)
+
+    service._upload_release_copy = record
+    assert service.run_sync().ok is True
+    assert len(uploaded_order) == 32
+
+    # A quarter of the way in, the backup already spans most of the corpus...
+    assert len({path.split("/")[0] for path in uploaded_order[:8]}) >= 3
+    # ...and half way in, all of it.
+    assert {path.split("/")[0] for path in uploaded_order[:16]} == set(years)
+
+    # Path order, by contrast, would have uploaded only the oldest year first.
+    from app.utils import iter_files
+
+    by_path = [
+        path.relative_to(data_dir).as_posix() for path in iter_files(data_dir, order="path")
+    ]
+    assert {path.split("/")[0] for path in by_path[:8]} == {"2019"}
