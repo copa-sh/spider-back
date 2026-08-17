@@ -7,6 +7,8 @@ import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
+from .utils import SYNC_ORDER_SPREAD, SYNC_ORDERS
+
 
 DEFAULT_UPLOADS_PREFIX = "storage"
 DEFAULT_BRANCH = "main"
@@ -17,6 +19,23 @@ DEFAULT_CHUNK_SIZE_MB = 24
 DEFAULT_COPY_COUNT = 1
 DEFAULT_INTERVAL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_REPOSITORY_PREFIX = "model"
+# Under GitHub's documented secondary limits (500/hour, 80/minute) so there is
+# headroom for requests issued outside our limiter. See app/rate_limit.py.
+DEFAULT_CONTENT_REQUESTS_PER_HOUR = 450
+DEFAULT_CONTENT_REQUESTS_PER_MINUTE = 70
+DEFAULT_MAX_CONCURRENCY = 3
+# One release asset per file when it fits; ~1 GiB parts otherwise. The hard
+# per-asset ceiling is 2 GiB, and each part costs exactly one content-generating
+# request, so bigger parts use the scarce budget better (24 MiB chunks waste it).
+DEFAULT_PART_SIZE_MB = 1024
+MAX_PART_SIZE_MB = 1900
+# Deep (download + hash) verification covers 1 file in every N per run. N=1
+# checks everything; N=100 covers the whole set across 100 runs with no overlap.
+DEFAULT_VERIFY_DEEP_EVERY_N = 1
+# Order in which sync walks APP_DATA_DIR. "spread" orders by a hash of the
+# relative path, so an interrupted first sync leaves a bit of everything backed
+# up instead of only the alphabetically-first (typically oldest) region.
+DEFAULT_SYNC_ORDER = SYNC_ORDER_SPREAD
 
 
 class ConfigError(Exception):
@@ -146,10 +165,22 @@ class AppConfig:
     tg_timeout_seconds: int = 900
     tg_max_retry: int = DEFAULT_MAX_RETRY
     tg_backoff_seconds: int = DEFAULT_BACKOFF_SECONDS
+    # Proactive request budget. The scarce GitHub resource is content-generating
+    # requests, not bytes, so these are the knobs that decide throughput.
+    github_content_requests_per_hour: int = DEFAULT_CONTENT_REQUESTS_PER_HOUR
+    github_content_requests_per_minute: int = DEFAULT_CONTENT_REQUESTS_PER_MINUTE
+    github_max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    github_part_size_mb: int = DEFAULT_PART_SIZE_MB
+    verify_deep_every_n: int = DEFAULT_VERIFY_DEEP_EVERY_N
+    sync_order: str = DEFAULT_SYNC_ORDER
 
     @property
     def github_chunk_size_bytes(self) -> int:
         return min(self.github_chunk_size_mb, 95) * 1024 * 1024
+
+    @property
+    def github_part_size_bytes(self) -> int:
+        return min(self.github_part_size_mb, MAX_PART_SIZE_MB) * 1024 * 1024
 
     @property
     def github_account_daily_upload_limit_bytes(self) -> int:
@@ -258,6 +289,10 @@ def load_config() -> AppConfig:
     if github_upload_sleep_min_seconds > github_upload_sleep_max_seconds:
         raise ConfigError("GITHUB_UPLOAD_SLEEP_MIN_SECONDS no puede ser mayor que GITHUB_UPLOAD_SLEEP_MAX_SECONDS.")
 
+    sync_order = (os.environ.get("SYNC_ORDER", DEFAULT_SYNC_ORDER).strip().lower() or DEFAULT_SYNC_ORDER)
+    if sync_order not in SYNC_ORDERS:
+        raise ConfigError(f"SYNC_ORDER debe ser uno de {', '.join(SYNC_ORDERS)}.")
+
     github_accounts = _discover_accounts()
     telegram_accounts = _discover_telegram_accounts()
     tg_channel_prefix = (
@@ -304,6 +339,16 @@ def load_config() -> AppConfig:
         tg_timeout_seconds=tg_timeout_seconds,
         tg_max_retry=tg_max_retry,
         tg_backoff_seconds=tg_backoff_seconds,
+        github_content_requests_per_hour=_env_int(
+            "GITHUB_CONTENT_REQUESTS_PER_HOUR", DEFAULT_CONTENT_REQUESTS_PER_HOUR
+        ),
+        github_content_requests_per_minute=_env_int(
+            "GITHUB_CONTENT_REQUESTS_PER_MINUTE", DEFAULT_CONTENT_REQUESTS_PER_MINUTE
+        ),
+        github_max_concurrency=_env_int("GITHUB_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY),
+        github_part_size_mb=_env_int("GITHUB_PART_SIZE_MB", DEFAULT_PART_SIZE_MB),
+        verify_deep_every_n=_env_int("VERIFY_DEEP_EVERY_N", DEFAULT_VERIFY_DEEP_EVERY_N),
+        sync_order=sync_order,
     )
 
     config.app_state_dir.mkdir(parents=True, exist_ok=True)

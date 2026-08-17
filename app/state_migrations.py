@@ -11,11 +11,14 @@ from .utils import utc_now_iso
 def migrate_state(state: dict[str, Any]) -> dict[str, Any]:
     migrated = deepcopy(state)
     _migrate_tasks(migrated)
-    migrated.setdefault("files", {})
     migrated.setdefault("github_accounts", {})
     migrated.setdefault("created_at", utc_now_iso())
     _migrate_github_accounts(migrated)
-    _migrate_files(migrated)
+    # `files` is no longer part of index.json — it lives in the SQLite registry.
+    # A legacy map is still normalized here so it can be imported losslessly;
+    # it is removed from index.json once the import succeeds.
+    if "files" in migrated:
+        _migrate_files(migrated)
     return migrated
 
 

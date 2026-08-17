@@ -120,3 +120,25 @@ def test_telegram_account_requires_all_three_fields(tmp_path):
     with patch.dict("os.environ", env, clear=True):
         with pytest.raises(ConfigError):
             load_config()
+
+
+def test_sync_order_defaults_to_spread(tmp_path):
+    with patch.dict("os.environ", _base_env(tmp_path), clear=True):
+        config = load_config()
+    assert config.sync_order == "spread"
+
+
+def test_sync_order_can_be_set_to_path(tmp_path):
+    env = _base_env(tmp_path)
+    env["SYNC_ORDER"] = "PATH"
+    with patch.dict("os.environ", env, clear=True):
+        config = load_config()
+    assert config.sync_order == "path"
+
+
+def test_sync_order_rejects_unknown_values(tmp_path):
+    env = _base_env(tmp_path)
+    env["SYNC_ORDER"] = "aleatorio"
+    with patch.dict("os.environ", env, clear=True):
+        with pytest.raises(ConfigError):
+            load_config()

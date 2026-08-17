@@ -106,10 +106,7 @@ HOME_TEMPLATE = """
     <p>Sin alertas.</p>
     {% endif %}
     <form method="post" action="{{ url_for('trigger_sync') }}">
-      <button type="submit">Sincronización Rápida (Optimizada)</button>
-    </form>
-    <form method="post" action="{{ url_for('trigger_full_sync') }}">
-      <button type="submit">Verificar y Sincronizar Todo</button>
+      <button type="submit">Sincronizar (solo lo nuevo o modificado)</button>
     </form>
     <form method="post" action="{{ url_for('trigger_verify') }}">
       <button type="submit">Lanzar verificacion de integridad</button>
@@ -188,16 +185,21 @@ FILES_TEMPLATE = """
   <body>
     <h1>Archivos</h1>
     <p><a href="{{ url_for('home') }}">Volver</a></p>
+    <p><strong>Total:</strong> {{ total }} | pagina {{ page }} ({{ files|length }} mostrados)</p>
     <ul>
       {% for file in files %}
       <li>
         <a href="{{ url_for('file_detail', file_id=file.file_id) }}">{{ file.path }}</a>
         | presente={{ file.present }}
-        | versiones={{ file.versions|length }}
+        | estado={{ file.status }}
         | error={{ "si" if file.last_error else "no" }}
       </li>
       {% endfor %}
     </ul>
+    <p>
+      {% if page > 1 %}<a href="{{ url_for('files', page=page-1, per_page=per_page) }}">&larr; anterior</a>{% endif %}
+      {% if has_next %}<a href="{{ url_for('files', page=page+1, per_page=per_page) }}">siguiente &rarr;</a>{% endif %}
+    </p>
   </body>
 </html>
 """
@@ -210,8 +212,14 @@ FILE_TEMPLATE = """
     <h1>{{ file.path }}</h1>
     <p><a href="{{ url_for('files') }}">Volver</a></p>
     <p><strong>Presente:</strong> {{ file.present }}</p>
+    <p><strong>Estado:</strong> {{ file.status }}</p>
     <p><strong>SHA al subir:</strong> {{ file.source_sha256 }}</p>
-    <p><strong>Ultima verificacion:</strong> {{ file.last_verification.checked_at if file.last_verification else "nunca" }}</p>
+    <p><strong>Ultima verificacion:</strong>
+      {% if file.last_verification %}
+        {{ file.last_verification.checked_at }} ({{ file.last_verification.depth or "deep" }},
+        {{ "ok" if file.last_verification.ok else "fallo" }})
+      {% else %}nunca{% endif %}
+    </p>
     <p><strong>Version activa:</strong> {{ file.active_version_id or "ninguna" }}</p>
     <p><strong>Error:</strong> {{ file.last_error or "ninguno" }}</p>
     <h2>Versiones</h2>
@@ -219,16 +227,22 @@ FILE_TEMPLATE = """
       {% for version in file.versions|reverse %}
       <li>
         {{ version.version_id }} | {{ version.created_at }} |
-        <a href="{{ version.manifest_raw_url }}">manifest</a> |
+        almacenamiento={{ version.storage or "blob" }} |
         copias={{ version.copies|length }} |
-        chunks={{ version.chunks|length }} |
-        commit={{ version.commit_sha or "pendiente" }} |
         sha={{ version.plaintext_sha256 }} |
-        cuenta={{ version.account_id }} |
-        repo={{ version.repository_owner }}/{{ version.repository }}
+        cuenta={{ version.account_id }}
         <ul>
           {% for copy in version.copies %}
-          <li>{{ copy.copy_index }}: {{ copy.network }} {{ copy.account_id }} {{ copy.repository_owner }}/{{ copy.repository }} commit={{ copy.commit_sha or "pendiente" }}</li>
+          <li>
+            {{ copy.copy_index }}: {{ copy.network }} {{ copy.account_id }}
+            {% if copy.storage == "release" %}
+              release={{ copy.release_tag }} partes={{ copy.parts|length }}
+              repo={{ copy.repository_owner }}/{{ copy.repository }}
+            {% else %}
+              chunks={{ copy.chunks|length }} commit={{ copy.commit_sha or "pendiente" }}
+              repo={{ copy.repository_owner }}/{{ copy.repository }}
+            {% endif %}
+          </li>
           {% endfor %}
         </ul>
       </li>
@@ -318,7 +332,6 @@ def create_web_app(service: AppService, login_manager: TelegramLoginManager | No
     def run_background(method_name: str) -> None:
         task_name_map = {
             "run_sync": "sync",
-            "run_full_sync": "sync",
             "run_verify": "verify",
         }
         task_name = task_name_map[method_name]
@@ -348,50 +361,9 @@ def create_web_app(service: AppService, login_manager: TelegramLoginManager | No
     @require_login
     def home():
         state = service.get_state()
-        files = list(state["files"].values())
-
-        def _active_version(item):
-            active_id = item.get("active_version_id")
-            for version in item.get("versions", []):
-                if version.get("version_id") == active_id:
-                    return version
-            return None
-
-        # Per-file distinct-account copy count of the active version (two copies
-        # under the same account count as one — see distinct_account_copy_count).
-        per_file_copies = [
-            service.distinct_account_copy_count(_active_version(item)) for item in files
-        ]
-        total_files = len(files)
-        copy_count_target = service.config.copy_count
-        copy_distribution = []
-        for threshold in range(1, copy_count_target + 1):
-            with_at_least = sum(1 for count in per_file_copies if count >= threshold)
-            percent = round(with_at_least / total_files * 100, 1) if total_files else 0.0
-            copy_distribution.append(
-                {"threshold": threshold, "count": with_at_least, "percent": percent}
-            )
-
-        stats = {
-          "present": sum(1 for item in files if item.get("present")),
-          "uploaded": sum(1 for item in files if item.get("active_version_id")),
-          "verified": sum(
-              1
-              for item in files
-              if (item.get("last_verification") or {}).get("ok") is True
-              and (item.get("last_verification") or {}).get("version_id") == item.get("active_version_id")
-          ),
-          "absent": sum(1 for item in files if not item.get("present")),
-          "with_error": sum(1 for item in files if item.get("last_error")),
-          "total_versions": sum(len(item.get("versions", [])) for item in files),
-          "total_copies": sum(
-              len(version.get("copies", []))
-              for item in files
-              for version in item.get("versions", [])
-          ),
-          "copy_count_target": copy_count_target,
-          "copy_distribution": copy_distribution,
-        }
+        # Counters come from SQL aggregates. Materialising every file here is
+        # what used to make the home page scale with the total volume.
+        stats = service.get_stats()
         next_sync = _next_run_text(state["tasks"]["sync"]["last_finished_at"], service.config.app_sync_interval_seconds)
         next_verify = _next_run_text(state["tasks"]["verify"]["last_finished_at"], service.config.app_verify_interval_seconds)
         return render_template_string(
@@ -405,15 +377,24 @@ def create_web_app(service: AppService, login_manager: TelegramLoginManager | No
     @app.get("/files")
     @require_login
     def files():
-        state = service.get_state()
-        items = sorted(state["files"].values(), key=lambda item: item["path"])
-        return render_template_string(FILES_TEMPLATE, files=items)
+        page = max(1, _parse_int(request.args.get("page", "1"), default=1))
+        per_page = min(max(_parse_int(request.args.get("per_page", "200"), default=200), 1), 1000)
+        offset = (page - 1) * per_page
+        items = service.list_files(limit=per_page, offset=offset)
+        total = service.registry.count_files()
+        return render_template_string(
+            FILES_TEMPLATE,
+            files=items,
+            page=page,
+            per_page=per_page,
+            total=total,
+            has_next=offset + per_page < total,
+        )
 
     @app.get("/files/<file_id>")
     @require_login
     def file_detail(file_id: str):
-        state = service.get_state()
-        file_entry = state["files"].get(file_id)
+        file_entry = service.get_file_detail(file_id)
         if not file_entry:
             abort(404)
         return render_template_string(FILE_TEMPLATE, file=file_entry)
@@ -437,12 +418,6 @@ def create_web_app(service: AppService, login_manager: TelegramLoginManager | No
     @require_login
     def trigger_sync():
         run_background("run_sync")
-        return redirect(url_for("home"))
-
-    @app.post("/actions/full-sync")
-    @require_login
-    def trigger_full_sync():
-        run_background("run_full_sync")
         return redirect(url_for("home"))
 
     @app.post("/actions/verify")
@@ -518,11 +493,14 @@ def _next_run_text(last_finished_at: str | None, interval_seconds: int) -> str:
 
 
 def _parse_line_count(raw_value: str) -> int:
+    return min(max(_parse_int(raw_value, default=200), 1), 1000)
+
+
+def _parse_int(raw_value: str, *, default: int) -> int:
     try:
-        parsed = int(raw_value)
-    except ValueError:
-        return 200
-    return min(max(parsed, 1), 1000)
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _read_tail(log_path: Path, line_count: int) -> tuple[str, str | None]:
