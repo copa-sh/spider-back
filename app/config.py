@@ -19,6 +19,8 @@ DEFAULT_CHUNK_SIZE_MB = 24
 DEFAULT_COPY_COUNT = 1
 DEFAULT_INTERVAL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_REPOSITORY_PREFIX = "model"
+DEFAULT_REPOSITORY_MAX_SIZE_KB = 524288
+DEFAULT_ACCOUNT_DAILY_UPLOAD_LIMIT_GB = 5.0
 # Under GitHub's documented secondary limits (500/hour, 80/minute) so there is
 # headroom for requests issued outside our limiter. See app/rate_limit.py.
 DEFAULT_CONTENT_REQUESTS_PER_HOUR = 450
@@ -276,8 +278,12 @@ def load_config() -> AppConfig:
         or DEFAULT_REPOSITORY_PREFIX
     )
     github_repository_private = _env_bool("GITHUB_REPOSITORY_PRIVATE", True)
-    github_repository_max_size_kb = _env_int("GITHUB_REPOSITORY_MAX_SIZE_KB")
-    github_account_daily_upload_limit_gb = _env_float("GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB")
+    github_repository_max_size_kb = _env_int(
+        "GITHUB_REPOSITORY_MAX_SIZE_KB", DEFAULT_REPOSITORY_MAX_SIZE_KB
+    )
+    github_account_daily_upload_limit_gb = _env_float(
+        "GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB", DEFAULT_ACCOUNT_DAILY_UPLOAD_LIMIT_GB
+    )
     # COPY_COUNT is the network-agnostic name. Fall back to the legacy
     # GITHUB_COPY_COUNT so existing deployments keep working.
     if os.environ.get("COPY_COUNT", "").strip():

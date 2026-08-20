@@ -40,6 +40,16 @@ def test_load_config_parses_numbered_accounts(tmp_path):
     assert config.github_account_daily_upload_limit_bytes == 1024**3
 
 
+def test_load_config_defaults_storage_limits(tmp_path):
+    env = _base_env(tmp_path)
+    env.pop("GITHUB_REPOSITORY_MAX_SIZE_KB")
+    env.pop("GITHUB_ACCOUNT_DAILY_UPLOAD_LIMIT_GB")
+    with patch.dict("os.environ", env, clear=True):
+        config = load_config()
+    assert config.github_repository_max_size_kb == 524288
+    assert config.github_account_daily_upload_limit_gb == 5.0
+
+
 def test_load_config_rejects_invalid_sleep_range(tmp_path):
     env = _base_env(tmp_path)
     env["GITHUB_UPLOAD_SLEEP_MIN_SECONDS"] = "2"
