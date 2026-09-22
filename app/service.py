@@ -375,8 +375,15 @@ class AppService:
             "uploaded_bytes": 0,
         }
         last_log_at = time.monotonic()
+        last_persist_at = time.monotonic()
 
         for file_path in iter_files(self.config.app_data_dir, order=self.config.sync_order):
+            # The scheduler (this loop) and the web UI can live in different
+            # processes — a gunicorn worker only ever sees state.json, not this
+            # in-progress dict. Without a periodic flush, per-account daily
+            # usage (and any alerts raised mid-run) stay invisible on the
+            # dashboard for the whole duration of a long sync.
+            last_persist_at = self._maybe_persist_progress(state, last_persist_at)
             rel_path = rel_path_str(self.config.app_data_dir, file_path)
             file_id = stable_file_id(rel_path)
             try:
@@ -523,6 +530,23 @@ class AppService:
             )
             return time.monotonic()
         return last_log_at
+
+    def _maybe_persist_progress(
+        self, state: dict[str, Any], last_persist_at: float, *, interval_s: float = 15.0
+    ) -> float:
+        """Flush in-progress state to disk every ``interval_s`` seconds.
+
+        ``_run_task`` only saves at the start and end of a run; on its own that
+        leaves per-account daily usage frozen at its start-of-run value for as
+        long as the sync takes, from the point of view of any process reading
+        state.json instead of this in-memory dict (e.g. a gunicorn worker,
+        since the scheduler runs in the master process).
+        """
+        now = time.monotonic()
+        if now - last_persist_at < interval_s:
+            return last_persist_at
+        self.state_manager.save(state)
+        return now
 
     def _adopt_version(
         self,
@@ -1550,6 +1574,25 @@ class AppService:
             "parts_checked": len(parts),
         }
 
+    def _telegram_session_exists(self, account: TelegramAccountConfig) -> bool:
+        return (self.config.app_state_dir / f"{account.account_id}.session").exists()
+
+    @staticmethod
+    def _is_telegram_auth_failure(exc: Exception) -> bool:
+        """Whether ``exc`` signals a broken/unverified Telegram session.
+
+        Covers a revoked or stale auth key (AUTH_KEY_UNREGISTERED, already
+        given one self-heal attempt inside TelegramClient) and the generic
+        "not signed in" errors Pyrogram raises when it connects without ever
+        having completed the login handshake. There is nothing a retry can
+        fix here — the account needs a fresh login from the web UI.
+        """
+        message = str(exc).upper()
+        return any(
+            marker in message
+            for marker in ("AUTH_KEY_UNREGISTERED", "AUTH_KEY_INVALID", "UNAUTHORIZED", "SESSION_REVOKED")
+        )
+
     def _upload_telegram_version_copy(
         self,
         state: dict[str, Any],
@@ -1699,7 +1742,11 @@ class AppService:
         # path is unchanged — including the fact that it materialises the file
         # in memory under a single nonce.
         remaining_telegram_accounts = [
-            acc for acc in self.config.telegram_accounts if acc.account_id not in used_account_ids
+            acc
+            for acc in self.config.telegram_accounts
+            if acc.account_id not in used_account_ids
+            and acc.account_id not in self._runtime_unavailable_accounts
+            and self._account_state(state, acc.account_id).get("available", True)
         ]
         if remaining_telegram_accounts and len(copies) < copy_count:
             encrypted = encrypt_bytes(file_path.read_bytes(), self.secrets.encryption_key_bytes())
@@ -1707,6 +1754,33 @@ class AppService:
             for tg_account in remaining_telegram_accounts:
                 if len(copies) >= copy_count:
                     break
+                used_account_ids.add(tg_account.account_id)
+
+                if not self._telegram_session_exists(tg_account):
+                    # No point connecting at all: without a session file there is
+                    # nothing to authenticate with, so this would just burn a
+                    # full retry/backoff cycle on every file for the rest of the
+                    # run. Skip straight away and surface it as an alert.
+                    message = (
+                        f"La cuenta Telegram {tg_account.account_id} no tiene una sesion "
+                        "iniciada. Inicia sesion desde la web para reanudar las subidas."
+                    )
+                    LOGGER.warning(
+                        "sync telegram sin sesion cuenta=%s: se omite sin reintentar", tg_account.account_id
+                    )
+                    self._mark_account_unavailable(
+                        state, tg_account.account_id, code="telegram_no_session", message=message,
+                    )
+                    copy_errors.append(
+                        {
+                            "copy_index": len(copies) + 1,
+                            "account_id": tg_account.account_id,
+                            "network": "telegram",
+                            "error": message,
+                        }
+                    )
+                    continue
+
                 try:
                     copy = self._upload_telegram_version_copy(
                         state,
@@ -1737,7 +1811,19 @@ class AppService:
                             "error": str(exc),
                         }
                     )
-                used_account_ids.add(tg_account.account_id)
+                    # A broken/unverified session will not fix itself on the next
+                    # file: retrying it again and again just wastes time and
+                    # hammers Telegram with doomed connection attempts. Mark the
+                    # account unavailable so the rest of this run (and future
+                    # runs, until the operator re-authenticates) skip it outright.
+                    if isinstance(exc, TelegramError) and self._is_telegram_auth_failure(exc):
+                        message = (
+                            f"La cuenta Telegram {tg_account.account_id} fallo la verificacion de "
+                            f"sesion: {exc}. Re-autentica desde la web para reanudar las subidas."
+                        )
+                        self._mark_account_unavailable(
+                            state, tg_account.account_id, code="telegram_auth_failed", message=message,
+                        )
 
         if not copies:
             # Report the real reason: this used to always blame the GitHub quota
@@ -1890,12 +1976,13 @@ class AppService:
     def _mark_account_unavailable(
         self,
         state: dict[str, Any],
-        account: GitHubAccountConfig,
+        account_id: str,
         *,
         code: str,
         message: str,
+        owner: str | None = None,
     ) -> None:
-        account_state = self._account_state(state, account.account_id, owner=account.owner)
+        account_state = self._account_state(state, account_id, owner=owner)
         detected_at = utc_now_iso()
         alerts = account_state.setdefault("alerts", [])
         existing = next((item for item in alerts if item.get("code") == code), None)
@@ -1913,7 +2000,28 @@ class AppService:
         account_state["available"] = False
         account_state["unavailable_reason"] = message
         account_state["unavailable_since"] = detected_at
-        self._runtime_unavailable_accounts.add(account.account_id)
+        self._runtime_unavailable_accounts.add(account_id)
+
+    def mark_telegram_account_reauthenticated(self, account_id: str) -> None:
+        """Clear a Telegram account's unavailable flag after a successful web re-login.
+
+        The sync scheduler and the web login flow can live in different
+        processes (gunicorn master vs. worker), so this writes straight to the
+        persisted state rather than the in-process live state: the scheduler
+        picks it up the next time it reloads state at the start of a run.
+        """
+        state = self.state_manager.load(self.default_config)
+        account_state = self._account_state(state, account_id)
+        account_state["available"] = True
+        account_state["unavailable_reason"] = None
+        account_state["unavailable_since"] = None
+        account_state["alerts"] = [
+            alert
+            for alert in account_state.get("alerts", [])
+            if alert.get("code") not in ("telegram_auth_failed", "telegram_no_session")
+        ]
+        self.state_manager.save(state)
+        self._runtime_unavailable_accounts.discard(account_id)
 
     def _handle_account_access_error(self, state: dict[str, Any], account: GitHubAccountConfig, exc: Exception) -> bool:
         message = str(exc)
@@ -1925,9 +2033,10 @@ class AppService:
         )
         self._mark_account_unavailable(
             state,
-            account,
+            account.account_id,
             code="personal_access_token_forbidden",
             message=alert_message,
+            owner=account.owner,
         )
         return True
 

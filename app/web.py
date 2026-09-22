@@ -303,6 +303,10 @@ def _build_login_manager(service: AppService) -> TelegramLoginManager:
         client = service.telegram_clients.get(account_id)
         if client is not None:
             client.reset()
+        # Clear any "unavailable" flag a prior verification failure set, so the
+        # scheduler (which may run in a different process) retries this account
+        # on its next sync instead of skipping it forever.
+        service.mark_telegram_account_reauthenticated(account_id)
 
     return TelegramLoginManager(
         client_factory=client_factory,

@@ -261,6 +261,10 @@ def make_service_with_telegram(tmp_path: Path):
     service.github_clients = {"account_1": FakeGitHubClient("owner-a")}
     service.telegram_clients = {"tg_account_1": FakeTelegramClient("tg_account_1")}
     service.telegram_account_by_id = {"tg_account_1": tg_account}
+    # The fake client simulates an already-authenticated account; a real one
+    # would have a *.session file on disk, which is what the sync path checks
+    # before attempting an upload (see AppService._telegram_session_exists).
+    (state_dir / "tg_account_1.session").touch()
     manager.load(service.default_config)
     return service, data_dir
 
@@ -977,6 +981,99 @@ def test_unplaceable_file_does_not_abort_whole_sync(tmp_path):
     row = only_file(service)
     assert row.last_error
     assert "telegram" in row.last_error.lower()
+
+
+def test_telegram_account_without_session_is_skipped_without_connecting(tmp_path):
+    service, data_dir = make_service_with_telegram(tmp_path)
+    (service.config.app_state_dir / "tg_account_1.session").unlink()
+
+    class ExplodingTelegramClient(FakeTelegramClient):
+        def list_managed_channels(self, prefix):
+            raise AssertionError("no debería intentar conectar sin sesión")
+
+    service.telegram_clients = {"tg_account_1": ExplodingTelegramClient("tg_account_1")}
+    (data_dir / "archivo.txt").write_bytes(b"contenido de prueba para telegram")
+
+    sync = service.run_sync()
+    assert sync.ok is False
+
+    state = service.get_state()
+    tg_summary = state["telegram_account_summaries"][0]
+    assert tg_summary["available"] is False
+    assert "sesion" in tg_summary["unavailable_reason"].lower()
+
+
+def test_telegram_auth_failure_disables_account_for_rest_of_run(tmp_path):
+    from app.telegram_api import TelegramError
+
+    class AuthBrokenTelegramClient(FakeTelegramClient):
+        def __init__(self, account_id):
+            super().__init__(account_id)
+            self.list_managed_channels_calls = 0
+
+        def list_managed_channels(self, prefix):
+            self.list_managed_channels_calls += 1
+            raise TelegramError("Error en list_managed_channels: AUTH_KEY_UNREGISTERED")
+
+    service, data_dir = make_service_with_telegram(tmp_path)
+    _exhaust_github_quota(service)
+    broken_client = AuthBrokenTelegramClient("tg_account_1")
+    service.telegram_clients = {"tg_account_1": broken_client}
+    for name in ("uno.txt", "dos.txt", "tres.txt"):
+        (data_dir / name).write_bytes(f"contenido {name}".encode())
+
+    sync = service.run_sync()
+    assert sync.ok is False
+    assert sync.summary["failed_files"] == 3
+
+    # Only the first file should have actually tried to connect: once the auth
+    # failure is seen, the account is marked unavailable and every subsequent
+    # file skips it outright instead of retrying the doomed connection.
+    assert broken_client.list_managed_channels_calls == 1
+
+    state = service.get_state()
+    tg_summary = state["telegram_account_summaries"][0]
+    assert tg_summary["available"] is False
+    assert "verificacion" in tg_summary["unavailable_reason"].lower()
+
+
+def test_reauthenticating_telegram_account_clears_unavailable_flag(tmp_path):
+    service, _data_dir = make_service_with_telegram(tmp_path)
+    state = service.state_manager.load(service.default_config)
+    service._mark_account_unavailable(
+        state, "tg_account_1", code="telegram_auth_failed", message="sesion invalida",
+    )
+    service.state_manager.save(state)
+
+    service.mark_telegram_account_reauthenticated("tg_account_1")
+
+    state = service.get_state()
+    tg_summary = state["telegram_account_summaries"][0]
+    assert tg_summary["available"] is True
+    assert tg_summary["unavailable_reason"] is None
+    assert "tg_account_1" not in service._runtime_unavailable_accounts
+
+
+def test_sync_persists_daily_usage_progress_mid_run(tmp_path):
+    # Regresión: el uso diario por cuenta solo se guardaba en disco al terminar
+    # toda la sync, así que un worker de gunicorn (proceso separado del que
+    # ejecuta el scheduler) veía siempre 0 mientras una sync larga corría.
+    service, data_dir, _ = make_service(tmp_path)
+    (data_dir / "archivo.txt").write_text("contenido" * 50, encoding="utf-8")
+
+    original_maybe_persist = service._maybe_persist_progress
+    persisted_snapshots = []
+
+    def spy_persist(state, last_persist_at, **kwargs):
+        result = original_maybe_persist(state, last_persist_at, interval_s=0.0)
+        on_disk = service.state_manager.load(service.default_config)
+        persisted_snapshots.append(on_disk["github_accounts"])
+        return result
+
+    service._maybe_persist_progress = spy_persist
+    sync = service.run_sync()
+    assert sync.ok is True
+    assert persisted_snapshots, "se esperaba al menos un guardado intermedio durante la sync"
 
 
 def test_verify_skips_telegram_copy_but_passes_github(tmp_path):
